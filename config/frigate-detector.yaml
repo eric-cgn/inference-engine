@@ -1,0 +1,27 @@
+# Frigate configuration snippet — add this to your frigate config.yml
+#
+# Each detector entry is a single-threaded ZMQ REQ pipe. Adding more entries lets
+# Frigate send frames concurrently rather than waiting for each round-trip to complete.
+# All pipes hit the same ROUTER socket; the engine batches them together and fans the
+# results back. Use at least one entry per GPU. Adding more may improve throughput by
+# keeping the GPU better fed, or may make no difference — it depends on camera count,
+# frame rate, batch size, and GPU speed.
+
+detectors:
+  zmq0:
+    type: zmq
+    endpoint: ipc:///run/zmq/detector.sock
+  # zmq1:
+  #   type: zmq
+  #   endpoint: ipc:///run/zmq/detector.sock
+
+model:
+  path: yolo26n.engine        # TRT-compiled engine (run tools/optimize.py first)
+  # path: yolo26n             # .pt fallback if you haven't compiled yet
+  # path: your-frigate-plus-model  # Frigate+ transfers the model automatically over ZMQ on first run
+  labelmap_path: /config/coco.labels
+  model_type: yolo-generic
+  input_tensor: nhwc
+  input_pixel_format: rgb
+  width: 640
+  height: 640

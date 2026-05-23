@@ -1,0 +1,30 @@
+# Docker Compose snippet for the Frigate inference engine.
+#
+# Merge this into your existing Frigate compose file:
+#   1. Add the zmq_ipc volume to your top-level volumes: section.
+#   2. Add zmq_ipc:/run/zmq to your frigate service's volumes.
+#   3. Add "depends_on: [frigate-inference]" to your frigate service.
+#   4. Add the frigate-inference service below.
+
+volumes:
+  zmq_ipc:   # ZMQ socket shared between Frigate and the inference engine
+
+services:
+  frigate-inference:
+    container_name: frigate-inference
+    image: frigate-inference:sm_61      # or sm_75plus — matches the arch/ build
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: arch/sm_61/Dockerfile  # or arch/sm_75plus/Dockerfile
+    volumes:
+      - zmq_ipc:/run/zmq               # ZMQ socket
+      - /path/to/your/models:/models   # persists downloaded and compiled models
+      - /path/to/your/config:/config:ro  # inference.yaml lives here
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

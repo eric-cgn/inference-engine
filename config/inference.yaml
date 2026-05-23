@@ -1,0 +1,29 @@
+# Frigate inference engine configuration
+# Place this file at the path your container mounts as /config/inference.yaml
+
+# ZMQ socket endpoint — must match Frigate's detector config and the zmq_ipc volume mount.
+endpoint: ipc:///run/zmq/detector.sock
+
+# Directory where model files are stored. Must match the /models volume mount.
+model_dir: /models
+
+# CUDA device. Use cuda:0 for a single GPU, cuda:1 for the second, etc.
+device: cuda:0
+
+# Floating point precision.
+#   fp32 — Full precision. Required for Pascal (GTX 10-series) and older.
+#   fp16 — Half precision. Tensor Cores on Turing (RTX 20-series) and newer. ~2x throughput.
+#   bf16 — BFloat16. Ampere (RTX 30-series) and newer only.
+precision: fp32
+
+# Engine backend. Currently only "yolo" is supported.
+engine_type: yolo
+
+# Number of parallel inference workers. Set to 1 for a single GPU.
+# For multi-GPU: set to the number of GPUs and set device: auto.
+num_workers: 1
+
+# Maximum batch size. Frames arriving while the GPU is busy are queued and
+# processed together. Higher values improve throughput; lower values reduce latency.
+# Must match the batch size used when compiling a TensorRT .engine file.
+max_batch_size: 16

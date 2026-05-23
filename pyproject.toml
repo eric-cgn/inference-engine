@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inference-engine"
+version = "0.1.0"
+description = "Frigate-compatible ZMQ inference engine w/ pipelined dynamic batching"
+requires-python = ">=3.9"
+dependencies = [
+    "pyzmq",
+    "numpy",
+    "PyYAML",
+]
+
+[project.scripts]
+inference-engine = "inference_engine.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["inference_engine*"]
