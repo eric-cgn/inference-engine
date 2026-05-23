@@ -1,0 +1,15 @@
+# Exclude PyTorch build workspace except the compiled wheels.
+# Without this, docker build sends gigabytes of source/ccache/build artifacts
+# to the Docker daemon on every build.
+pytorch-workspace/src/pytorch/
+pytorch-workspace/src/vision/
+pytorch-workspace/build-torch/
+pytorch-workspace/build-vision/
+pytorch-workspace/pip-cache/
+pytorch-workspace/ccache/
+
+# Dev artifacts
+**/__pycache__/
+**/*.pyc
+tools/zmq/
+tools/server_last_run.log
