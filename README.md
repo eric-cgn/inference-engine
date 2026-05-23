@@ -35,20 +35,19 @@ After the first run, compile the model to a TensorRT `.engine` file. This gives 
 significant speedup (2-3x on Pascal) because TRT generates GPU-native code at compile time
 rather than interpreting the model graph at runtime.
 
-Run the optimizer from inside the running container:
+`run-optimize.sh` runs on the host. It spins up a fresh inference server container,
+waits for the ZMQ socket, then runs `optimize.py` inside a second container against
+the same volumes. Both are torn down on exit and server logs are saved to
+`tools/server_last_run.log`.
 
 ```bash
-docker exec -it frigate-inference python3 /app/tools/optimize.py yolo26n
+./tools/run-optimize.sh yolo26n
 ```
 
-The script reads `precision` and `max_batch_size` from your `inference.yaml` so the engine
-always matches the server's settings. It then signals the running server to load the new
-engine — no restart needed.
-
-For a Frigate+ model already in `/models`:
+For a Frigate+ model (after Frigate has transferred it on first run):
 
 ```bash
-docker exec -it frigate-inference python3 /app/tools/optimize.py your-model-name
+./tools/run-optimize.sh your-model-name
 ```
 
 After compilation, update your Frigate config to reference the `.engine` file:
@@ -61,7 +60,32 @@ model:
 To benchmark without recompiling:
 
 ```bash
-docker exec -it frigate-inference python3 /app/tools/optimize.py yolo26n --test-only
+./tools/run-optimize.sh yolo26n --test-only
+```
+
+Override the image tag via the `INFERENCE_IMAGE` environment variable if needed:
+
+```bash
+INFERENCE_IMAGE=frigate-inference:sm_75plus ./tools/run-optimize.sh yolo26n
+```
+
+## Directory layout
+
+This repo is designed to be merged into your Frigate directory so that `/config` and
+`/models` — the paths used by the containers and by `tools/optimize.py` on the host —
+resolve to the same locations:
+
+```
+your-frigate/
+├── compose.yaml
+├── config/
+│   ├── config.yml
+│   └── inference.yaml
+├── models/
+├── build/                  ← inference_engine/, arch/, pyproject.toml
+└── tools/
+    ├── optimize.py
+    └── run-optimize.sh
 ```
 
 ## Setup
@@ -80,8 +104,8 @@ No custom build required.
 # Build and start
 docker compose up -d frigate-inference
 
-# First run: compile TRT engine (takes a few minutes)
-docker exec -it frigate-inference python3 /app/tools/optimize.py yolo26n
+# Compile TRT engine (inference server must be running)
+./tools/run-optimize.sh yolo26n
 ```
 
 Set `precision: fp16` in `inference.yaml` to use Tensor Cores for roughly 2x throughput.
@@ -105,7 +129,7 @@ Then bring up the container:
 
 ```bash
 docker compose up -d frigate-inference
-docker exec -it frigate-inference python3 /app/tools/optimize.py yolo26n
+./tools/run-optimize.sh yolo26n
 ```
 
 Keep `precision: fp32` for Pascal — Pascal does not have Tensor Cores.

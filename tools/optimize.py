@@ -2,17 +2,20 @@
 """
 TensorRT engine compiler and inference benchmark for the Frigate inference engine.
 
-Usage (inside the running inference container):
-    docker exec -it frigate-inference python3 /app/tools/optimize.py <model_name>
-    docker exec -it frigate-inference python3 /app/tools/optimize.py <model_name> --test-only
+Intended to be invoked via tools/run-optimize.sh, which mounts this script into a
+fresh inference container alongside the running server. Can also be run directly
+inside any container that has the required dependencies and volume mounts.
+
+Usage (via wrapper):
+    ./tools/run-optimize.sh <model_name> [--test-only]
 
 <model_name> examples:
     yolo26n          — auto-downloads weights from Ultralytics (default)
     yolo26s          — larger / more accurate variant
     your-model       — any .pt or .onnx already in /models/
 
-Reads precision and max_batch_size from /config/inference.yaml so the compiled
-engine always matches the server's runtime settings.
+Reads precision and max_batch_size from /config/inference.yaml (or $CONFIG_PATH)
+so the compiled engine always matches the server's runtime settings.
 
 Steps:
     1. Locate or download the source model (.pt or .onnx)
