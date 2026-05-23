@@ -1,9 +1,14 @@
-# Frigate Inference Engine
+# Frigate-Compatible ZMQ Inference Pipeliner
 
-A GPU-accelerated external detector for [Frigate NVR](https://frigate.video) that replaces
-Frigate's built-in detector with a pipelined, dynamically-batching ZMQ inference server.
+A GPU-accelerated inference server that leverages Frigate NVR's built-in ZMQ detector
+support to provide pipelined, dynamically-batching inference, with support for Pascal GPUs.
 
 Supports multiple GPU, multiple workers per GPU, and dynamic batch sizes.
+
+This is not part of any official distribution, is not endorsed by anyone, and comes with
+no guarantee of fitness for any purpose. Getting a working sm_61 build together was enough
+of a PITA that it seemed worth sharing — and these cards are still plenty capable of
+running YOLO `n` and `s` models at useful framerates.
 
 ## Why this exists
 
