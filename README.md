@@ -82,9 +82,11 @@ INFERENCE_IMAGE=frigate-inference:sm_75plus ./tools/run-optimize.sh yolo26n
 
 ## Directory layout
 
-This repo is designed to be merged into your Frigate directory so that `/config` and
-`/models` — the paths used by the containers and by `tools/optimize.py` on the host —
-resolve to the same locations:
+While it can be run standalone with any client that is compatible with the
+Frigate ZMQ inference protocol, like the included optimization engine-builder,
+when used with Frigate, can also be merged into your Frigate directory so that 
+`/config` and `/models` — the paths used by the containers and by 
+`tools/optimize.py` on the host — resolve to the same locations.
 
 ```
 your-frigate/
