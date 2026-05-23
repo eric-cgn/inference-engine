@@ -3,12 +3,18 @@
 A GPU-accelerated inference server that leverages Frigate NVR's built-in ZMQ detector
 support to provide pipelined, dynamically-batching inference, with support for Pascal GPUs.
 
-Supports multiple GPU, multiple workers per GPU, and dynamic batch sizes.
+Supports multiple GPU (theoretically), multiple workers per GPU, and dynamic batch sizes.
 
 This is not part of any official distribution, is not endorsed by anyone, and comes with
 no guarantee of fitness for any purpose. Getting a working sm_61 build together was enough
 of a PITA that it seemed worth sharing — and these cards are still plenty capable of
 running YOLO `n` and `s` models at useful framerates.
+
+Oh, and I should mention, it was written entirely by Claude and Gemini with very little oversight
+other than a little bit of architectural guidance and some copy-pasting for testing. It
+does work though, and got me off custom Frigate container builds which is very nice QOL
+upgrade. Maybe you find it useful if you're the type that likes keeping old tech doing
+meaningful work.
 
 ## Why this exists
 
@@ -37,7 +43,7 @@ Any other YOLO-format model that ultralytics can load (`.pt`, `.onnx`) also work
 ## TensorRT optimization
 
 After the first run, compile the model to a TensorRT `.engine` file. This gives a
-significant speedup (2-3x on Pascal) because TRT generates GPU-native code at compile time
+significant speedup (I saw 2x on Pascal) because TRT generates GPU-native code at compile time
 rather than interpreting the model graph at runtime.
 
 `run-optimize.sh` runs on the host. It spins up a fresh inference server container,
@@ -103,7 +109,9 @@ your-frigate/
 
 ### Turing and newer (RTX 2060, 3060, 3080, 4090, …)
 
-Untested. YMMV.
+Untested. YMMV. At least you should not try to use the sm_61 build though. Also,
+I'm pretty sure your card still works with default builds, but maybe the pipelining here would
+provide an improvement, or maybe you want to run the non-trt images for your base Frigate.
 
 ### Pascal (GTX 1050 Ti, 1060, 1070, 1080 Ti — sm_6.1)
 
