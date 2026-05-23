@@ -28,8 +28,8 @@ behind. Turing and newer (RTX 2060+) work with standard wheels and need no speci
 
 **YOLO26n (default)** — free, auto-downloads on first use (imports Ultralytics). The latest generation model
 with meaningfully better accuracy than YOLO11 at similar speed. With a TensorRT engine
-compiled for your GPU, yolo26n runs at **80-100 FPS on a GTX 1050 Ti** — more than enough
-headroom for a significant number of cameras.
+compiled for your GPU, yolo26n runs at ~80 FPS on a GTX 1050 Ti** — more than enough
+headroom for a significant number of cameras at 5 fps detection rates.
 
 **Frigate+ models** — if you have a Frigate+ subscription, point your Frigate config at
 your model and Frigate transfers it to the inference engine automatically over ZMQ on first
