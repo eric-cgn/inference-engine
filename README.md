@@ -225,3 +225,10 @@ same ROUTER. The broker fans them across workers. Use at least one entry per GPU
 more may improve throughput by keeping the GPU better fed, or may make no difference —
 it depends on camera count, frame rate, batch size, and GPU speed. For a single GPU,
 `num_workers: 1` is optimal.
+
+## A Note on the License
+
+FWIW, anything actually copyrightable in this project is licensed
+under [AGPL-3.0](LICENSE) due to its use of
+[Ultralytics](https://github.com/ultralytics/ultralytics), which has produced
+some very cool models and a robust and convenient library.
