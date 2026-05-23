@@ -93,22 +93,12 @@ your-frigate/
 ### Prerequisites
 
 - Docker with NVIDIA Container Toolkit
-- Frigate NVR (tested with 0.14+)
+- Frigate NVR 0.17.1
 - For Pascal builds: a Linux host with `--gpus all` access during the wheel build
 
 ### Turing and newer (RTX 2060, 3060, 3080, 4090, …)
 
-No custom build required.
-
-```bash
-# Build and start
-docker compose up -d frigate-inference
-
-# Compile TRT engine (inference server must be running)
-./tools/run-optimize.sh yolo26n
-```
-
-Set `precision: fp16` in `inference.yaml` to use Tensor Cores for roughly 2x throughput.
+Untested. YMMV.
 
 ### Pascal (GTX 1050 Ti, 1060, 1070, 1080 Ti — sm_6.1)
 
