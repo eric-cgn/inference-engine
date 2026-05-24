@@ -122,12 +122,16 @@ else:
         is_dynamic  = dim0.HasField("dim_param") or not dim0.HasField("dim_value")
         batch_val   = None if is_dynamic else dim0.dim_value
 
-        if not is_dynamic and batch_val != MAX_BATCH_SIZE:
-            print(f"\n[ERROR] ONNX model has static batch size {batch_val}, "
-                  f"but max_batch_size={MAX_BATCH_SIZE}.")
-            print(f"Either set max_batch_size: {batch_val} in inference.yaml, "
-                  f"or use a dynamically-batched export.")
-            sys.exit(1)
+        if not is_dynamic:
+            print(f"Static batch={batch_val} in ONNX — making batch dimension dynamic for batch={MAX_BATCH_SIZE}...")
+            import copy
+            model_dyn = copy.deepcopy(onnx_model)
+            for t in list(model_dyn.graph.input) + list(model_dyn.graph.output):
+                t.type.tensor_type.shape.dim[0].dim_param = "batch"
+            dyn_path = source_file + ".dyn.onnx"
+            onnx.save(model_dyn, dyn_path)
+            source_file = dyn_path
+            is_dynamic = True
 
         logger_trt = trt.Logger(trt.Logger.INFO)
         builder    = trt.Builder(logger_trt)
@@ -152,7 +156,7 @@ else:
             inp     = network.get_input(0)
             profile.set_shape(inp.name,
                               (1, 3, 640, 640),
-                              (1, 3, 640, 640),
+                              (MAX_BATCH_SIZE, 3, 640, 640),
                               (MAX_BATCH_SIZE, 3, 640, 640))
             config.add_optimization_profile(profile)
         else:
