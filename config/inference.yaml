@@ -26,4 +26,4 @@ num_workers: 1
 # Maximum batch size. Frames arriving while the GPU is busy are queued and
 # processed together. Higher values improve throughput; lower values reduce latency.
 # Must match the batch size used when compiling a TensorRT .engine file.
-max_batch_size: 3
+max_batch_size: 1
