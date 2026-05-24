@@ -33,6 +33,17 @@ RUN pip3 install --no-cache-dir /tmp/wheels/*.whl && rm -rf /tmp/wheels
 COPY arch/sm_61/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 
+# ── TensorRT libs ─────────────────────────────────────────────────────────
+# tensorrt-libs==8.6.1 was removed from PyPI (only TRT 9.x available now,
+# which dropped Pascal/sm_61 support). Copy the .so bundle from the previous
+# working image so the PyPI tensorrt-bindings package can find them at runtime.
+COPY --from=frigate-inference:sm_61 \
+     /usr/local/lib/python3.10/dist-packages/tensorrt_libs \
+     /usr/local/lib/python3.10/dist-packages/tensorrt_libs
+COPY --from=frigate-inference:sm_61 \
+     /usr/local/lib/python3.10/dist-packages/tensorrt_libs-8.6.1.dist-info \
+     /usr/local/lib/python3.10/dist-packages/tensorrt_libs-8.6.1.dist-info
+
 # ── cu11 shared libraries ──────────────────────────────────────────────────
 # onnxruntime-gpu 1.18.1 depends on CUDA 11 libs that pip installs under
 # site-packages. Register them with ldconfig so the dynamic linker finds them.
