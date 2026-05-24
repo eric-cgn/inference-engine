@@ -14,8 +14,10 @@ else
     echo "${ENV_FILE} already exists, skipping."
 fi
 
-# ── Load env to find FRIGATE_CONFIG_DIR ───────────────────────────────────────
+# ── Load env ──────────────────────────────────────────────────────────────────
 set -a; source "${ENV_FILE}"; set +a
+
+FRIGATE_COMPOSE="${FRIGATE_COMPOSE:-/opt/frigate/compose.yaml}"
 FRIGATE_CONFIG_DIR="${FRIGATE_CONFIG_DIR:-/opt/frigate/config}"
 
 # ── inference.yaml ────────────────────────────────────────────────────────────
@@ -34,38 +36,24 @@ else
 fi
 
 # ── Frigate compose integration ───────────────────────────────────────────────
-FRIGATE_COMPOSE="${FRIGATE_CONFIG_DIR%/config}/compose.yaml"
-INCLUDE_LINE="    - path: ${SCRIPT_DIR}/compose.yaml"
-
-if [[ -f "${FRIGATE_COMPOSE}" ]]; then
-    if grep -q "${SCRIPT_DIR}/compose.yaml" "${FRIGATE_COMPOSE}" 2>/dev/null; then
-        echo "Frigate compose already includes inference-engine, skipping."
-    else
-        echo ""
-        echo "Add the following to your Frigate compose.yaml to include the inference service:"
-        echo ""
-        echo "  include:"
-        echo "    - path: ${SCRIPT_DIR}/compose.yaml"
-        echo "      env_file: ${ENV_FILE}"
-        echo ""
-        echo "Also add to the frigate service volumes:"
-        echo "      - zmq_ipc:/run/zmq"
-        echo ""
-        echo "And add to the frigate service:"
-        echo "      depends_on: [frigate-inference]"
-    fi
+if [[ -f "${FRIGATE_COMPOSE}" ]] && grep -q "${SCRIPT_DIR}/compose.yaml" "${FRIGATE_COMPOSE}" 2>/dev/null; then
+    echo "Frigate compose already includes inference-engine, skipping."
 else
     echo ""
-    echo "Could not find Frigate compose at ${FRIGATE_COMPOSE}."
-    echo "Add this to your Frigate compose.yaml manually:"
+    echo "Add the following include to ${FRIGATE_COMPOSE}:"
     echo ""
     echo "  include:"
     echo "    - path: ${SCRIPT_DIR}/compose.yaml"
     echo "      env_file: ${ENV_FILE}"
+    echo ""
+    echo "Also ensure the frigate service has:"
+    echo "      volumes:"
+    echo "        - zmq_ipc:/run/zmq"
+    echo "      depends_on: [frigate-inference]"
 fi
 
 echo ""
 echo "Done. Next steps:"
-echo "  1. Edit ${ENV_FILE}"
+echo "  1. Review ${ENV_FILE}"
 echo "  2. Build the image:  cd ${SCRIPT_DIR} && arch/sm_61/build.sh"
-echo "  3. Start services:   cd <frigate-dir> && docker compose up -d"
+echo "  3. Start services:   cd \$(dirname ${FRIGATE_COMPOSE}) && docker compose up -d"

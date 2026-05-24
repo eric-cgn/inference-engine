@@ -82,20 +82,27 @@ INFERENCE_IMAGE=frigate-inference:sm_75plus ./tools/run-optimize.sh yolo26n
 
 ## Directory layout
 
-While it can be run standalone with any client that is compatible with the
-Frigate ZMQ inference protocol, like the included optimization engine-builder,
-when used with Frigate, can also be merged into your Frigate directory so that 
-`/config` and `/models` — the paths used by the containers and by 
-`tools/optimize.py` on the host — resolve to the same locations.
+This repo lives alongside your Frigate installation as a peer directory:
 
 ```
-your-frigate/
-├── compose.yaml
+/opt/frigate/                   ← your existing Frigate install
+├── compose.yaml                ← add include: pointing here (see Setup)
 ├── config/
 │   ├── config.yml
-│   └── inference.yaml
-├── models/
-├── build/                  ← inference_engine/, arch/, pyproject.toml
+│   └── inference.yaml          ← copied by install.sh
+└── models/
+
+/opt/inference-engine/          ← this repo
+├── install.sh
+├── compose.yaml                ← included by Frigate compose
+├── .env                        ← your local settings (created by install.sh)
+├── .env.example
+├── arch/
+│   ├── sm_61/                  ← Pascal build
+│   └── sm_75plus/              ← Turing+ build
+├── config/
+│   └── inference.yaml          ← template
+├── inference_engine/
 └── tools/
     ├── optimize.py
     └── run-optimize.sh
@@ -109,19 +116,54 @@ your-frigate/
 - Frigate NVR 0.17.1
 - For Pascal builds: a Linux host with `--gpus all` access during the wheel build
 
-### Turing and newer (RTX 2060, 3060, 3080, 4090, …)
+### 1. Install
 
-Untested. YMMV. At least you should not try to use the sm_61 build though. Also,
-I'm pretty sure your card still works with default builds, but maybe the pipelining here would
-provide an improvement, or maybe you want to run the non-trt images for your base Frigate.
+```bash
+git clone https://github.com/eric-cgn/inference-engine /opt/inference-engine
+cd /opt/inference-engine
+./install.sh
+```
 
-### Pascal (GTX 1050 Ti, 1060, 1070, 1080 Ti — sm_6.1)
+`install.sh` creates `.env` from `.env.example`, copies `inference.yaml` into your
+Frigate config directory, and prints the `include:` block to add to your Frigate
+`compose.yaml`.
+
+Edit `.env` to set your paths and image tag, then add the printed `include:` block
+to the top of your Frigate `compose.yaml`:
+
+```yaml
+include:
+  - path: /opt/inference-engine/compose.yaml
+    env_file: /opt/inference-engine/.env
+```
+
+Also add to your `frigate` service:
+
+```yaml
+    volumes:
+      - zmq_ipc:/run/zmq
+    depends_on: [frigate-inference]
+```
+
+### 2. Build the image
+
+#### Turing and newer (RTX 2060, 3060, 3080, 4090, …)
+
+Untested. YMMV. Standard PyTorch wheels work fine on Turing+, so the pipelining
+here may or may not improve your setup over the default Frigate detector.
+
+```bash
+arch/sm_75plus/build.sh
+```
+
+Set `INFERENCE_IMAGE=frigate-inference:sm_75plus` in `.env`.
+
+#### Pascal (GTX 1050 Ti, 1060, 1070, 1080 Ti — sm_6.1)
 
 Official PyTorch wheels don't support Pascal. Build custom wheels first:
 
 ```bash
-cd arch/sm_61
-./build.sh
+arch/sm_61/build.sh
 ```
 
 The build script clones PyTorch v2.5.1 and Torchvision v0.20.1, compiles them inside a
@@ -130,19 +172,20 @@ Docker container with `TORCH_CUDA_ARCH_LIST=6.1`, and drops the resulting `.whl`
 The build takes 1-3 hours depending on your CPU. It is resumable — build caches are
 bind-mounted so an interrupted build picks up where it left off.
 
-Then bring up the container:
+Keep `precision: fp32` in `inference.yaml` for Pascal — Pascal does not have Tensor Cores.
+
+### 3. Start
 
 ```bash
-docker compose up -d frigate-inference
+cd /opt/frigate
+docker compose up -d
 ./tools/run-optimize.sh yolo26n
 ```
 
-Keep `precision: fp32` for Pascal — Pascal does not have Tensor Cores.
-
 ## Configuration
 
-Copy `config/inference.yaml` to your config directory (mounted as `/config` in the
-container) and adjust as needed. All settings can also be overridden by environment
+`install.sh` copies `config/inference.yaml` into your Frigate config directory.
+Edit it there to adjust settings. All settings can also be overridden by environment
 variables.
 
 | Setting | Default | Description |
@@ -181,8 +224,9 @@ model:
 
 ## Compose integration
 
-See [compose.yaml](compose.yaml) for the service snippet to merge into your Frigate
-compose file, including the shared ZMQ volume.
+The `frigate-inference` service and shared `zmq_ipc` volume are defined in
+[compose.yaml](compose.yaml) and pulled into your Frigate compose via the `include:`
+directive added during setup. No manual merging required.
 
 ## Stats
 
