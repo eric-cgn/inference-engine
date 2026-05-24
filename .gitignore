@@ -1,1 +1,13 @@
+.DS_Store
 
+# PyTorch build workspace — gigabytes of source, build artifacts, and ccache.
+# Only the compiled .whl files in pytorch-workspace/src/ matter, but those are
+# also excluded since they're large binaries reproduced by arch/sm_61/build.sh.
+pytorch-workspace/
+
+tools/zmq/
+tools/server_last_run.log
+
+**/__pycache__/
+**/*.pyc
+.env
