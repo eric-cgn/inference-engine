@@ -32,6 +32,9 @@ RUN pip3 install --no-cache-dir /tmp/wheels/*.whl && rm -rf /tmp/wheels
 # past that pin without raising a conflict error.
 COPY arch/sm_61/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+# opencv 4.13 added numpy>=2 to its PyPI metadata but works fine with 1.26.4.
+# Install with --no-deps to bypass that spurious constraint.
+RUN pip3 install --no-cache-dir --no-deps opencv-python==4.13.0.92
 
 # ── TensorRT libs ─────────────────────────────────────────────────────────
 # tensorrt-libs==8.6.1 was removed from PyPI (only TRT 9.x available now,

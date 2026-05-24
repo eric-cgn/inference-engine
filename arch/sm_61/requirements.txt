@@ -31,7 +31,6 @@ nvidia-cudnn-cu12==9.22.0.52
 # ── Inference stack ────────────────────────────────────────────────────────
 ultralytics==8.4.51
 ultralytics-thop==2.0.19
-opencv-python==4.13.0.92
 pyzmq==27.1.0
 PyYAML==6.0.3
 pillow==12.2.0
