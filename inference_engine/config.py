@@ -11,8 +11,11 @@ _DEFAULTS = {
     "device":         None,   # resolved below
     "precision":      "fp32",
     "num_workers":    1,
-    "max_batch_size": 16,
+    "max_batch_size": 1,
+    "optimize":       "always",
 }
+
+_VALID_OPTIMIZE = {"always", "if_present", "never"}
 
 
 class ServerConfig:
@@ -25,6 +28,7 @@ class ServerConfig:
         self.engine_type    = os.environ.get("ENGINE_TYPE",  "yolo")
         self.num_workers    = int(os.environ.get("NUM_WORKERS",    _DEFAULTS["num_workers"]))
         self.max_batch_size = int(os.environ.get("MAX_BATCH_SIZE", _DEFAULTS["max_batch_size"]))
+        self.optimize       = os.environ.get("OPTIMIZE",     _DEFAULTS["optimize"])
         self.max_dets       = 20
 
         # backend_endpoint is an internal ZMQ detail, not user-facing.
@@ -45,11 +49,16 @@ class ServerConfig:
                 if "ENGINE_TYPE"    not in os.environ: self.engine_type    = data.get("engine_type",    self.engine_type)
                 if "NUM_WORKERS"    not in os.environ: self.num_workers    = int(data.get("num_workers",    self.num_workers))
                 if "MAX_BATCH_SIZE" not in os.environ: self.max_batch_size = int(data.get("max_batch_size", self.max_batch_size))
+                if "OPTIMIZE"       not in os.environ: self.optimize       = data.get("optimize",       self.optimize)
                 logger.info(f"Loaded configuration from {config_path}")
             except Exception as e:
                 logger.error(f"Failed to load config file {config_path}: {e}")
         else:
             logger.info(f"No config file at {config_path} — using defaults / env vars.")
+
+        if self.optimize not in _VALID_OPTIMIZE:
+            logger.warning(f"Unknown optimize value '{self.optimize}' — falling back to 'always'")
+            self.optimize = "always"
 
     def summary(self):
         return {
@@ -59,4 +68,5 @@ class ServerConfig:
             "engine_type": self.engine_type,
             "num_workers": self.num_workers,
             "max_batch":   self.max_batch_size,
+            "optimize":    self.optimize,
         }

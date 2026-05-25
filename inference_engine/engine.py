@@ -27,19 +27,24 @@ class InferenceEngine(ABC):
     """
 
     def __init__(self, device: str, model_dir: str,
-                 max_dets: int = 20, precision: str = "fp32"):
+                 max_dets: int = 20, precision: str = "fp32",
+                 optimize: str = "if_present", max_batch_size: int = 1):
         if precision not in _VALID_PRECISIONS:
             raise ValueError(
                 f"precision must be one of {_VALID_PRECISIONS}, got '{precision}'"
             )
-        self.device     = device
-        self.model_dir  = model_dir
-        self.max_dets   = max_dets
-        self.precision  = precision
-        self.model      = None
-        self.model_name = None
-        self.model_path = None
-        self.model_mtime = None
+        self.device          = device
+        self.model_dir       = model_dir
+        self.max_dets        = max_dets
+        self.precision       = precision
+        self.optimize        = optimize
+        self.max_batch_size  = max_batch_size
+        self.model           = None
+        self.model_name      = None
+        self.model_path      = None
+        self.model_mtime     = None
+        self._compiling      = False
+        self._compile_failed = False
 
     @abstractmethod
     def load_model(self, path: str) -> bool:

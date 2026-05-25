@@ -6,8 +6,11 @@
 numpy==1.26.4
 
 # ── TensorRT ───────────────────────────────────────────────────────────────
-# TRT 8.6 is the last release with sm_61 (Pascal) support.
-tensorrt==8.6.1.post1
+# TRT 8.6.1 split pip packages are on NVIDIA's own index (not PyPI). The
+# --find-links options below point pip at the direct package pages.
+--find-links https://pypi.nvidia.com/tensorrt-libs/
+--find-links https://pypi.nvidia.com/tensorrt-bindings/
+tensorrt-libs==8.6.1
 tensorrt-bindings==8.6.1
 
 # ── ONNX ───────────────────────────────────────────────────────────────────

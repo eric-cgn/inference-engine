@@ -1,6 +1,15 @@
+import hashlib
+import json
 import logging
 import os
+import re
+import threading
+import time
 import numpy as np
+
+# Frigate Plus model names are MD5 hashes (32 lowercase hex chars).
+# Ultralytics model names are short alphanumeric slugs (e.g. yolo26n).
+_HASH_RE = re.compile(r'^[0-9a-f]{32,}$')
 
 logger = logging.getLogger("yolo_engine")
 
@@ -17,9 +26,13 @@ class YoloEngine(InferenceEngine):
         .cpu() call collects final detections — no per-anchor GPU→CPU transfers.
 
     Ultralytics fallback (.onnx / .pt files):
-        Used when no compiled engine exists yet. Slower due to Python-side
-        pre/post-processing; intended only for the first run before optimize.py
-        has compiled an engine.
+        Used when no compiled engine is available. Slower due to Python-side
+        pre/post-processing.
+
+    The `optimize` config parameter controls engine compilation:
+        always     — compile .engine on first use if not present (blocks until done)
+        if_present — use .engine if found, else fall back to source model (default)
+        never      — load exactly the path given, no engine substitution
     """
 
     # ── Shared TRT runtime (one per process) ──────────────────────────────
@@ -37,37 +50,350 @@ class YoloEngine(InferenceEngine):
     def load_model(self, path: str) -> bool:
         try:
             original_path = path
-            engine_path = path + ".engine"
+            ext = os.path.splitext(path)[1]
+            base = path[:-len(ext)] if ext in (".onnx", ".pt", ".engine") else path
+            engine_path = base + ".engine"
 
-            if os.path.exists(engine_path):
-                path = engine_path
-            elif not os.path.splitext(path)[1]:
-                aliased = path + ".onnx"
-                if os.path.exists(path) and not os.path.exists(aliased):
-                    os.symlink(os.path.basename(path), aliased)
-                path = aliased
+            if self.optimize == "never":
+                resolved = path
+                logger.debug(f"optimize=never — using model as given: {path}")
 
-            mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
-            if (self.model is not None and self.model_path == path
+            elif self.optimize == "if_present":
+                if os.path.exists(engine_path):
+                    logger.info(f"Engine file found, using TRT path: {engine_path}")
+                    resolved = engine_path
+                else:
+                    resolved = self._resolve_source(path)
+                    if resolved is None:
+                        logger.error(f"Model not found: {path}")
+                        return False
+                    logger.info(f"No engine at {engine_path} — loading source model: {resolved}")
+
+            elif self.optimize == "always":
+                meta_path = base + ".metadata"
+                source    = self._resolve_source(path)
+
+                status, reason = self._check_engine(source, engine_path, meta_path)
+
+                if status == "use":
+                    logger.info(f"Engine valid (metadata verified): {os.path.basename(engine_path)}")
+
+                elif status == "write_meta":
+                    logger.info(f"Engine found without metadata — writing: {os.path.basename(meta_path)}")
+                    if source:
+                        self._write_metadata(source, engine_path, meta_path)
+
+                else:  # compile or recompile
+                    orig_ext  = os.path.splitext(original_path)[1]
+                    bare_name = not orig_ext
+                    stem      = os.path.splitext(os.path.basename(original_path))[0]
+
+                    if source is None and not bare_name:
+                        logger.error(
+                            f"optimize=always: no source model found for '{path}' "
+                            f"— place a .onnx or .pt file in {self.model_dir}"
+                        )
+                        return False
+
+                    if source is None and bare_name and _HASH_RE.match(stem):
+                        # Hash-named model with no local file — Frigate will send the
+                        # bytes via model_data. Signal False so Frigate sends the data.
+                        return False
+
+                    if self._compiling:
+                        logger.info(f"Compilation in progress: {os.path.basename(engine_path)}")
+                        return True
+
+                    self._compiling = True
+                    self.model_name = os.path.basename(original_path)
+
+                    _src    = source
+                    _status = status
+                    _reason = reason
+                    _bare   = bare_name
+                    _stem   = stem
+
+                    def _bg():
+                        try:
+                            src = _src
+                            if src is None and _bare:
+                                src = self._try_ultralytics_download(_stem)
+                                if src is None:
+                                    logger.error(f"Auto-download failed for '{_stem}' — compilation aborted")
+                                    self._compile_failed = True
+                                    return
+                            verb = "Compiling" if _status == "compile" else "Recompiling"
+                            logger.info(f"{verb} engine (background): {_reason}")
+                            self._compile_engine_locked(src, engine_path, meta_path)
+                            self._load_trt_direct(engine_path)
+                            self.model_path  = engine_path
+                            self.model_mtime = os.path.getmtime(engine_path)
+                            self._compile_failed = False
+                            logger.info(f"Background compilation complete — engine ready: {os.path.basename(engine_path)}")
+                        except Exception as e:
+                            logger.error(f"Background compilation failed: {e}")
+                            self._compile_failed = True
+                        finally:
+                            self._compiling = False
+
+                    threading.Thread(target=_bg, daemon=True).start()
+                    return True
+
+                resolved = engine_path
+
+            else:
+                logger.warning(f"Unknown optimize='{self.optimize}', falling back to if_present")
+                resolved = engine_path if os.path.exists(engine_path) else self._resolve_source(path) or path
+
+            mtime = os.path.getmtime(resolved) if os.path.exists(resolved) else 0.0
+            if (self.model is not None and self.model_path == resolved
                     and self.model_mtime == mtime):
-                logger.info(f"Model {os.path.basename(original_path)} already loaded.")
+                logger.debug(f"Model {os.path.basename(original_path)} already loaded (up to date).")
                 return True
 
-            logger.info(f"Loading YOLO model: {path}  device={self.device}  precision={self.precision}")
+            logger.info(f"Loading YOLO model: {resolved}  device={self.device}  precision={self.precision}")
 
-            if path.endswith(".engine"):
-                self._load_trt_direct(path)
+            if resolved.endswith(".engine"):
+                self._load_trt_direct(resolved)
             else:
-                self._load_ultralytics(path)
+                self._load_ultralytics(resolved)
 
             self.model_name  = os.path.basename(original_path)
-            self.model_path  = path
+            self.model_path  = resolved
             self.model_mtime = mtime
             logger.info(f"Model {self.model_name} loaded.")
             return True
         except Exception as e:
             logger.error(f"Failed to load model {path}: {e}")
             return False
+
+    def _resolve_source(self, path: str):
+        """Return a loadable source path (.onnx or .pt), or None if not found."""
+        ext = os.path.splitext(path)[1]
+        if ext in (".onnx", ".pt") and os.path.exists(path):
+            return path
+        if not ext and os.path.exists(path):
+            # Extension-less file — Frigate stores ONNX without extension
+            alias = path + ".onnx"
+            if not os.path.exists(alias):
+                os.symlink(os.path.basename(path), alias)
+            return alias
+        for candidate_ext in (".onnx", ".pt"):
+            candidate = path + candidate_ext
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    def _try_ultralytics_download(self, stem: str) -> str | None:
+        """Download a named ultralytics model .pt to model_dir. Returns path or None."""
+        try:
+            import ultralytics
+            ultralytics.utils.checks.check_requirements = lambda *a, **kw: True
+            from ultralytics import YOLO
+            target = os.path.join(self.model_dir, stem + ".pt")
+            logger.info(f"Downloading {stem}.pt via ultralytics → {target}")
+            YOLO(target)
+            if os.path.exists(target):
+                logger.info(f"Download complete: {target}")
+                return target
+            logger.error(f"ultralytics download did not produce {target}")
+            return None
+        except Exception as e:
+            logger.error(f"ultralytics download failed for '{stem}': {e}")
+            return None
+
+    @staticmethod
+    def _sha256(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return "sha256:" + h.hexdigest()
+
+    def _check_engine(self, source_path, engine_path: str, meta_path: str):
+        """
+        Decide whether the engine is usable as-is or needs action.
+
+        Returns (status, reason):
+          "use"        — hashes + batch + precision all match, proceed
+          "compile"    — engine file does not exist
+          "recompile"  — engine exists but is stale (reason explains why)
+          "write_meta" — engine exists, metadata absent (pre-compiled / old install)
+        """
+        if not os.path.exists(engine_path):
+            return ("compile", "engine file not found")
+
+        if not os.path.exists(meta_path):
+            return ("write_meta", "metadata missing")
+
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except Exception as e:
+            return ("recompile", f"metadata unreadable: {e}")
+
+        if meta.get("engine_batch") != self.max_batch_size:
+            return ("recompile",
+                    f"batch size changed {meta.get('engine_batch')} → {self.max_batch_size}")
+
+        if meta.get("precision") != self.precision:
+            return ("recompile",
+                    f"precision changed {meta.get('precision')} → {self.precision}")
+
+        if source_path and os.path.exists(source_path):
+            current = self._sha256(source_path)
+            stored  = meta.get("model_hash", "")
+            if current != stored:
+                return ("recompile",
+                        f"source model changed ({stored[:15]}… → {current[:15]}…)")
+
+        current_eng = self._sha256(engine_path)
+        if current_eng != meta.get("engine_hash", ""):
+            return ("recompile", "engine file modified externally")
+
+        return ("use", None)
+
+    def _write_metadata(self, source_path: str, engine_path: str, meta_path: str):
+        meta = {
+            "model":        os.path.basename(source_path) if source_path else None,
+            "model_hash":   self._sha256(source_path) if source_path and os.path.exists(source_path) else None,
+            "engine":       os.path.basename(engine_path),
+            "engine_hash":  self._sha256(engine_path),
+            "engine_batch": self.max_batch_size,
+            "precision":    self.precision,
+            "engine_type":  "yolo",
+        }
+        tmp = meta_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(meta, f, indent=2)
+        try:
+            os.rename(tmp, meta_path)
+        except FileNotFoundError:
+            if not os.path.exists(meta_path):
+                raise
+        logger.info(f"Metadata written: {os.path.basename(meta_path)}")
+
+    def _compile_engine_locked(self, source_path: str, engine_path: str,
+                                meta_path: str = None):
+        """Compile source_path → engine_path, serialized across workers via flock."""
+        import fcntl
+        lock_path = engine_path + ".lock"
+        with open(lock_path, "w") as lf:
+            waited = False
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                logger.info(f"Another worker is compiling — waiting: {lock_path}")
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                waited = True
+
+            if waited:
+                # Re-validate: another worker may have just finished a good engine
+                if meta_path:
+                    status, _ = self._check_engine(source_path, engine_path, meta_path)
+                    if status == "use":
+                        logger.info(f"Engine compiled and validated by another worker: {os.path.basename(engine_path)}")
+                        return
+                elif os.path.exists(engine_path):
+                    logger.info(f"Engine compiled by another worker: {os.path.basename(engine_path)}")
+                    return
+
+            self._compile_engine(source_path, engine_path)
+            if meta_path:
+                self._write_metadata(source_path, engine_path, meta_path)
+
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+
+    def _compile_engine(self, source_path: str, engine_path: str):
+        """Compile ONNX/PT → TRT engine. Caller must hold the compile lock."""
+        t0 = time.time()
+        logger.info(
+            f"TRT engine compilation starting: {os.path.basename(source_path)} "
+            f"(precision={self.precision}, max_batch={self.max_batch_size})"
+        )
+        logger.info("Engine compilation may take several minutes — inference unavailable until complete")
+
+        if source_path.endswith(".pt"):
+            self._compile_engine_from_pt(source_path, engine_path)
+        else:
+            self._compile_engine_from_onnx(source_path, engine_path)
+
+        elapsed = time.time() - t0
+        logger.info(f"TRT engine compiled in {elapsed:.1f}s → {engine_path}")
+
+    def _compile_engine_from_onnx(self, source_path: str, engine_path: str):
+        import onnx
+        import tensorrt as trt
+        import copy
+
+        onnx_model = onnx.load(source_path)
+        inp_shape  = onnx_model.graph.input[0].type.tensor_type.shape
+        dim0       = inp_shape.dim[0]
+        is_dynamic = dim0.HasField("dim_param") or not dim0.HasField("dim_value")
+
+        # Read spatial dims from ONNX; fall back to 640 if dynamic or 0.
+        def _static_dim(d):
+            return d.dim_value if d.HasField("dim_value") and d.dim_value > 0 else 0
+        h = _static_dim(inp_shape.dim[2]) or 640
+        w = _static_dim(inp_shape.dim[3]) or 640
+        logger.info(f"ONNX input spatial size: {h}×{w}")
+
+        if not is_dynamic:
+            logger.info("Static batch ONNX — patching to dynamic for TRT optimization profile")
+            model_dyn = copy.deepcopy(onnx_model)
+            for t in list(model_dyn.graph.input) + list(model_dyn.graph.output):
+                t.type.tensor_type.shape.dim[0].dim_param = "batch"
+            dyn_path = source_path + ".dyn.onnx"
+            onnx.save(model_dyn, dyn_path)
+            source_path = dyn_path
+
+        logger_trt = trt.Logger(trt.Logger.WARNING)
+        builder    = trt.Builder(logger_trt)
+        network    = builder.create_network(
+            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+        )
+        parser = trt.OnnxParser(network, logger_trt)
+        with open(source_path, "rb") as f:
+            if not parser.parse(f.read()):
+                errors = [str(parser.get_error(i)) for i in range(parser.num_errors)]
+                raise RuntimeError(f"ONNX parse failed: {'; '.join(errors)}")
+
+        config = builder.create_builder_config()
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 * 1024 ** 3)
+        if self.precision == "fp16":
+            config.set_flag(trt.BuilderFlag.FP16)
+
+        profile = builder.create_optimization_profile()
+        inp = network.get_input(0)
+        profile.set_shape(inp.name,
+                          (1, 3, h, w),
+                          (self.max_batch_size, 3, h, w),
+                          (self.max_batch_size, 3, h, w))
+        config.add_optimization_profile(profile)
+
+        engine_bytes = builder.build_serialized_network(network, config)
+        if engine_bytes is None:
+            raise RuntimeError("TRT engine build returned None — check TRT logs above")
+
+        tmp_path = engine_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(engine_bytes)
+        os.rename(tmp_path, engine_path)   # atomic swap
+
+    def _compile_engine_from_pt(self, source_path: str, engine_path: str):
+        import ultralytics
+        ultralytics.utils.checks.check_requirements = lambda *a, **kw: True
+        from ultralytics import YOLO
+        model = YOLO(source_path)
+        model.export(format="engine", half=(self.precision == "fp16"),
+                     dynamic=True, batch=self.max_batch_size, device=0)
+        # Ultralytics writes <source>.engine alongside the .pt
+        exported = os.path.splitext(source_path)[0] + ".engine"
+        if os.path.exists(exported) and exported != engine_path:
+            os.rename(exported, engine_path)
 
     def _load_trt_direct(self, path: str):
         import tensorrt as trt

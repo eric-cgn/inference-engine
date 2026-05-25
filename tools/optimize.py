@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-TensorRT engine compiler and inference benchmark for the Frigate inference engine.
+Inference benchmark and optional engine pre-compiler for the Frigate inference engine.
 
-Intended to be invoked via tools/run-optimize.sh, which mounts this script into a
-fresh inference container alongside the running server. Can also be run directly
-inside any container that has the required dependencies and volume mounts.
+With optimize=always in inference.yaml the server compiles .engine files automatically
+on first use — this script is no longer required for normal operation. Its primary use
+is benchmarking throughput against a running server and optionally pre-compiling an
+engine before starting the server (e.g. on a fresh deployment).
 
 Usage (via wrapper):
     ./tools/run-optimize.sh <model_name> [--test-only]
@@ -15,12 +16,12 @@ Usage (via wrapper):
     your-model       — any .pt or .onnx already in /models/
 
 Reads precision and max_batch_size from /config/inference.yaml (or $CONFIG_PATH)
-so the compiled engine always matches the server's runtime settings.
+so any compiled engine matches the server's runtime settings.
 
 Steps:
     1. Locate or download the source model (.pt or .onnx)
-    2. Compile a TensorRT .engine file optimised for the host GPU
-    3. Signal the running server to load the new engine
+    2. Compile a TensorRT .engine file if one does not already exist (skip with --test-only)
+    3. Signal the running server to load the engine
     4. Run a 15-second multi-threaded benchmark and print throughput statistics
 """
 

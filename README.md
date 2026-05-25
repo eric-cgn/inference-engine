@@ -35,44 +35,30 @@ headroom for a significant number of cameras at 5 fps detection rates.
 your model and Frigate transfers it to the inference engine automatically over ZMQ on first
 run. No manual file placement needed. See
 [config/frigate-detector.yaml](config/frigate-detector.yaml) for the Frigate config snippet.
-Once transferred, run `tools/optimize.py` to compile it to a TRT engine for maximum
-performance.
 
 Any other YOLO-format model that ultralytics can load (`.pt`, `.onnx`) also works.
 
 ## TensorRT optimization
 
-After the first run, compile the model to a TensorRT `.engine` file. This gives a
-significant speedup (I saw 2x on Pascal) because TRT generates GPU-native code at compile time
-rather than interpreting the model graph at runtime.
+Compiling to a TensorRT `.engine` file gives a significant speedup (2x on Pascal) because
+TRT generates GPU-native code at compile time rather than interpreting the model graph
+at runtime.
 
-`run-optimize.sh` runs on the host. It spins up a fresh inference server container,
-waits for the ZMQ socket, then runs `optimize.py` inside a second container against
-the same volumes. Both are torn down on exit and server logs are saved to
-`tools/server_last_run.log`.
+With `optimize: always` in `inference.yaml` (the default), the server compiles the engine
+automatically on first use — no manual step required. Compilation blocks inference for
+a few minutes on first run; subsequent starts use the cached engine immediately. A
+per-engine file lock ensures only one worker compiles even when `num_workers > 1`.
 
-```bash
-./tools/run-optimize.sh yolo26n
-```
-
-For a Frigate+ model (after Frigate has transferred it on first run):
+To pre-compile before starting the server, or to run a throughput benchmark:
 
 ```bash
-./tools/run-optimize.sh your-model-name
+./tools/run-optimize.sh yolo26n           # compile (if needed) + benchmark
+./tools/run-optimize.sh yolo26n --test-only  # benchmark only, no compilation
 ```
 
-After compilation, update your Frigate config to reference the `.engine` file:
-
-```yaml
-model:
-  path: yolo26n.engine
-```
-
-To benchmark without recompiling:
-
-```bash
-./tools/run-optimize.sh yolo26n --test-only
-```
+`run-optimize.sh` spins up a fresh inference container, waits for the ZMQ socket, runs
+`optimize.py` inside a second container against the same volumes, then tears both down.
+Server logs are saved to `tools/server_last_run.log`.
 
 Override the image tag via the `INFERENCE_IMAGE` environment variable if needed:
 
@@ -179,8 +165,12 @@ Keep `precision: fp32` in `inference.yaml` for Pascal — Pascal does not have T
 ```bash
 cd /opt/frigate
 docker compose up -d
-./tools/run-optimize.sh yolo26n
 ```
+
+With `optimize: always` (default), the engine compiles automatically on first use.
+Watch the logs for compilation progress: `docker logs -f frigate-inference`.
+The first request blocks until compilation finishes (typically 1-5 minutes).
+Subsequent starts load the cached `.engine` file immediately.
 
 ## Configuration
 
@@ -196,7 +186,8 @@ variables.
 | `precision` | `fp32` | `fp32` / `fp16` / `bf16` |
 | `engine_type` | `yolo` | Inference backend (only `yolo` currently) |
 | `num_workers` | `1` | Parallel workers (for multi-GPU) |
-| `max_batch_size` | `16` | Maximum frames per GPU batch |
+| `max_batch_size` | `1` | Maximum frames per GPU batch |
+| `optimize` | `always` | `always` — auto-compile `.engine` on first use; `if_present` — use engine if found, else fall back; `never` — always load the model as named |
 
 ## Frigate configuration
 

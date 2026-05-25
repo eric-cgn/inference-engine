@@ -27,3 +27,14 @@ num_workers: 1
 # processed together. Higher values improve throughput; lower values reduce latency.
 # Must match the batch size used when compiling a TensorRT .engine file.
 max_batch_size: 1
+
+# TensorRT engine optimization mode.
+#   always     — Compile a .engine file the first time a model is requested if one
+#                does not already exist, then use it for all subsequent runs.
+#                Only one worker compiles; others wait. Inference is unavailable
+#                during compilation (typically 1-5 minutes on first run).
+#   if_present — Use a pre-compiled .engine if it exists alongside the model file;
+#                otherwise fall back to the source model via Ultralytics. (default)
+#   never      — Always load the model file exactly as named; never look for or
+#                create a .engine file.
+optimize: always

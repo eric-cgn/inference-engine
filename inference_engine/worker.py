@@ -17,10 +17,12 @@ def run_worker(idx, cfg, shared_name, worker_socket):
     device = f"cuda:{idx}" if cfg.device == "auto" else cfg.device
     engine = create_engine(
         cfg.engine_type,
-        device    = device,
-        model_dir = cfg.model_dir,
-        max_dets  = cfg.max_dets,
-        precision = cfg.precision,
+        device         = device,
+        model_dir      = cfg.model_dir,
+        max_dets       = cfg.max_dets,
+        precision      = cfg.precision,
+        optimize       = cfg.optimize,
+        max_batch_size = cfg.max_batch_size,
     )
     run_batch_worker(
         endpoint          = f"ipc://{worker_socket}",

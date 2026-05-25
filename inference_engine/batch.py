@@ -1,5 +1,7 @@
+import hashlib
 import json
 import logging
+import os
 import socket as _socket
 import time
 import threading
@@ -62,6 +64,7 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
                 logger.error("model_request missing model_name")
                 resp = json.dumps({"model_available": False, "model_loaded": False, "request_id": req_id}).encode()
             else:
+                engine._compile_failed = False
                 path = f"{engine.model_dir}/{name}"
                 loaded = engine.load_model(path)
                 if loaded:
@@ -80,17 +83,30 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
                 logger.error("model_data missing model_name or payload frame")
                 resp = json.dumps({"model_saved": False, "model_loaded": False, "request_id": req_id}).encode()
             else:
-                import os
                 save_name = name
                 if not os.path.splitext(name)[1]:
                     save_name = name + ".onnx"
 
                 path = f"{engine.model_dir}/{save_name}"
                 try:
-                    with open(path, "wb") as f:
-                        f.write(msg[3])
-                    logger.info(f"Saved model payload to {path} ({len(msg[3])} bytes)")
+                    data = msg[3]
+                    incoming_hash = hashlib.sha256(data).hexdigest()
+                    skip_write = False
+                    if os.path.exists(path):
+                        h = hashlib.sha256()
+                        with open(path, "rb") as f:
+                            for chunk in iter(lambda: f.read(1 << 20), b""):
+                                h.update(chunk)
+                        skip_write = (h.hexdigest() == incoming_hash)
 
+                    if skip_write:
+                        logger.info(f"Model payload unchanged ({len(data)} bytes), skipping write: {save_name}")
+                    else:
+                        with open(path, "wb") as f:
+                            f.write(data)
+                        logger.info(f"Saved model payload to {path} ({len(data)} bytes)")
+
+                    engine._compile_failed = False
                     loaded = engine.load_model(f"{engine.model_dir}/{name}")
                     if loaded:
                         if shared_model_name is not None:
@@ -119,12 +135,20 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
                     and engine.model_name is not None
                     and _base(engine.model_name) == _base(current_model)
                 )
-                if not is_loaded:
+                if (not is_loaded
+                        and not getattr(engine, '_compiling', False)
+                        and not getattr(engine, '_compile_failed', False)):
                     logger.info(f"Worker lazily loading active model: {current_model}")
                     engine.load_model(f"{engine.model_dir}/{current_model}")
 
             if engine.model is None:
-                deferred.append(msg)
+                rh = json.dumps({
+                    "shape": [engine.max_dets, 6],
+                    "dtype": "float32",
+                    "request_id": req_id,
+                }).encode()
+                zeros = np.zeros((engine.max_dets, 6), np.float32).tobytes()
+                control_replies.append((ident, rh, zeros))
             else:
                 shape = tuple(header["shape"])
                 dtype = np.dtype(header.get("dtype", "uint8"))
@@ -271,8 +295,8 @@ def run_batch_worker(endpoint: str, engine: InferenceEngine,
             ctrl, run_identities, run_request_ids, run_frames, deferred_msgs = _decode_msgs(
                 raw_msgs, engine, max_batch_size, stats, shared_model_name
             )
-            for ident, resp in ctrl:
-                sock.send_multipart([ident, b"", resp])
+            for reply in ctrl:
+                sock.send_multipart([reply[0], b""] + list(reply[1:]))
 
             if not run_frames:
                 continue
@@ -301,8 +325,8 @@ def run_batch_worker(endpoint: str, engine: InferenceEngine,
                         raw_next, engine, max_batch_size, stats, shared_model_name
                     )
                     deferred_msgs.extend(more_deferred)
-                    for ident, resp in ctrl:
-                        sock.send_multipart([ident, b"", resp])
+                    for reply in ctrl:
+                        sock.send_multipart([reply[0], b""] + list(reply[1:]))
                     next_identities.extend(new_idents)
                     next_request_ids.extend(new_req_ids)
                     next_frames.extend(new_frames)

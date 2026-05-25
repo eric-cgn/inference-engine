@@ -59,10 +59,12 @@ def main():
         # for a single GPU — there is no routing layer to traverse.
         engine = create_engine(
             config.engine_type,
-            device    = config.device,
-            model_dir = config.model_dir,
-            max_dets  = config.max_dets,
-            precision = config.precision,
+            device         = config.device,
+            model_dir      = config.model_dir,
+            max_dets       = config.max_dets,
+            precision      = config.precision,
+            optimize       = config.optimize,
+            max_batch_size = config.max_batch_size,
         )
         run_batch_worker(
             endpoint      = config.endpoint,
