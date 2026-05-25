@@ -204,7 +204,7 @@ detectors:
   #   endpoint: ipc:///run/zmq/detector.sock
 
 model:
-  path: yolo26n.engine
+  path: yolo26n
   labelmap_path: /config/coco.labels
   model_type: yolo-generic
   input_tensor: nhwc
