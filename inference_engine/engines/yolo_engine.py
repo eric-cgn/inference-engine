@@ -93,6 +93,12 @@ class YoloEngine(InferenceEngine):
         self._inp_h = shape[2]   # 640
         self._inp_w = shape[3]   # 640
 
+        out_shape = list(self._trt_engine.get_tensor_shape(self._trt_out))
+        # Post-NMS engines output (N, K, 6): x1,y1,x2,y2,conf,cls — already filtered.
+        # Raw head engines output (N, 4+classes, anchors): external NMS required.
+        self._nms_in_model = (len(out_shape) == 3 and out_shape[2] == 6)
+        logger.info(f"TRT output {out_shape} → {'post-NMS (skipping external NMS)' if self._nms_in_model else 'raw head (applying external NMS)'}")
+
         # Warm-up
         dummy = torch.zeros(1, 3, self._inp_h, self._inp_w, device="cuda")
         self._trt_forward(dummy)
@@ -146,7 +152,6 @@ class YoloEngine(InferenceEngine):
 
         frames = list(frames_np) if frames_np.ndim == 4 else [frames_np]
         batch  = len(frames)
-        zeros  = np.zeros((batch, self.max_dets, 6), np.float32)
 
         # ── Preprocess ────────────────────────────────────────────────────
         tensors = []
@@ -166,12 +171,31 @@ class YoloEngine(InferenceEngine):
             inp = F.interpolate(inp, (self._inp_h, self._inp_w),
                                 mode="bilinear", align_corners=False)
 
-        # ── TRT forward ───────────────────────────────────────────────────
-        raw = self._trt_forward(inp)               # (N, 45, 8400)
+        raw = self._trt_forward(inp)
 
-        # ── Decode boxes: (cx,cy,w,h) pixel → (x1,y1,x2,y2) normalised ──
+        # ── Post-NMS path: (N, K, 6) — x1,y1,x2,y2,conf,cls in pixel coords
+        if self._nms_in_model:
+            raw_np = raw.cpu().numpy()
+            results = []
+            for i in range(batch):
+                out  = np.zeros((self.max_dets, 6), np.float32)
+                dets = raw_np[i]                       # (K, 6)
+                dets = dets[dets[:, 4] > 0]            # drop zero-conf padding rows
+                n    = min(len(dets), self.max_dets)
+                if n:
+                    d = dets[:n]
+                    out[:n, 0] = d[:, 5]               # cls
+                    out[:n, 1] = d[:, 4]               # conf
+                    out[:n, 2] = d[:, 1] / self._inp_h # y1 normalised
+                    out[:n, 3] = d[:, 0] / self._inp_w # x1 normalised
+                    out[:n, 4] = d[:, 3] / self._inp_h # y2 normalised
+                    out[:n, 5] = d[:, 2] / self._inp_w # x2 normalised
+                results.append(out)
+            return np.array(results)
+
+        # ── Raw head path: decode (cx,cy,w,h) → (x1,y1,x2,y2), apply NMS ──
         scale = float(self._inp_h)
-        b = raw[:, :4, :] / scale                  # (N, 4, 8400)
+        b  = raw[:, :4, :] / scale                 # (N, 4, 8400)
         cx, cy, w, h = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
         x1 = (cx - w * 0.5).clamp(0.0, 1.0)
         y1 = (cy - h * 0.5).clamp(0.0, 1.0)
