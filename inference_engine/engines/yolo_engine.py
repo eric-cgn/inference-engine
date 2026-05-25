@@ -184,9 +184,13 @@ class YoloEngine(InferenceEngine):
         CONF = 0.25
         IOU  = 0.45
 
+        # Zero-area boxes (center clamped to boundary) cause divide-by-zero in
+        # Norfair's distance function and crash the camera processor process.
+        area = (x2 - x1) * (y2 - y1)              # (N, 8400)
+
         results = []
         for i in range(batch):
-            mask = conf[i] > CONF
+            mask = (conf[i] > CONF) & (area[i] > 0)
             if not mask.any():
                 results.append(np.zeros((self.max_dets, 6), np.float32))
                 continue
