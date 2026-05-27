@@ -49,6 +49,7 @@ else:
 
 PRECISION      = _config.get("precision",      "fp32")
 MAX_BATCH_SIZE = int(_config.get("max_batch_size", 16))
+NUM_WORKERS    = int(_config.get("num_workers", 1))
 ENDPOINT       = _config.get("endpoint", os.environ.get("ZMQ_ENDPOINT", "ipc:///run/zmq/detector.sock"))
 
 if len(sys.argv) < 2 or (len(sys.argv) == 2 and sys.argv[1] == "--test-only"):
@@ -59,6 +60,15 @@ TEST_ONLY = "--test-only" in sys.argv
 if TEST_ONLY:
     sys.argv.remove("--test-only")
 
+# --threads N overrides the default thread count
+_threads_override = None
+for _i, _arg in enumerate(sys.argv):
+    if _arg == "--threads" and _i + 1 < len(sys.argv):
+        _threads_override = int(sys.argv[_i + 1])
+        sys.argv.pop(_i + 1)
+        sys.argv.pop(_i)
+        break
+
 MODEL_NAME = sys.argv[1]
 for ext in (".engine", ".onnx", ".pt"):
     if MODEL_NAME.endswith(ext):
@@ -67,7 +77,7 @@ for ext in (".engine", ".onnx", ".pt"):
 HALF = (PRECISION == "fp16")
 
 print(f"endpoint={ENDPOINT}  model={MODEL_NAME}  precision={PRECISION}  "
-      f"max_batch={MAX_BATCH_SIZE}  half={HALF}")
+      f"max_batch={MAX_BATCH_SIZE}  num_workers={NUM_WORKERS}  half={HALF}")
 
 # ── ZMQ connection ─────────────────────────────────────────────────────────────
 ctx  = zmq.Context()
@@ -193,15 +203,19 @@ if not resp_dict.get("model_loaded"):
 image_path = "/test_client_image.png"
 if os.path.exists(image_path):
     print(f"\nLoading test image from {image_path}...")
-    img = Image.open(image_path).convert("RGB").resize((640, 640))
+    img    = Image.open(image_path).convert("RGB").resize((640, 640))
+    tensor = np.array(img, dtype=np.uint8)
 else:
-    print("\nNo test image found — downloading sample...")
-    url = "https://raw.githubusercontent.com/ultralytics/yolov5/master/data/images/bus.jpg"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req) as r:
-        img = Image.open(r).convert("RGB").resize((640, 640))
-
-tensor     = np.array(img, dtype=np.uint8)
+    try:
+        print("\nNo test image found — downloading sample...")
+        url = "https://raw.githubusercontent.com/ultralytics/yolov5/master/data/images/bus.jpg"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            img    = Image.open(r).convert("RGB").resize((640, 640))
+        tensor = np.array(img, dtype=np.uint8)
+    except Exception:
+        print("Download failed — using random noise image.")
+        tensor = np.random.randint(0, 256, (640, 640, 3), dtype=np.uint8)
 inf_header = json.dumps({"shape": list(tensor.shape), "dtype": "uint8"}).encode()
 
 # Single warm-up pass before spawning benchmark threads
@@ -209,7 +223,7 @@ send_and_recv(sock, [inf_header, tensor.tobytes()])
 sock.close()
 
 TEST_DURATION    = 15.0
-NUM_THREADS      = MAX_BATCH_SIZE
+NUM_THREADS      = _threads_override if _threads_override is not None else MAX_BATCH_SIZE * NUM_WORKERS
 results_lock     = threading.Lock()
 total_latencies  = []
 first_pass_count = 0
