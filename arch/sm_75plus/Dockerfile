@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -15,11 +15,13 @@ WORKDIR /app
 # Update --index-url when PyTorch publishes wheels for a newer CUDA version.
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip3 install torch torchvision \
-    --index-url https://download.pytorch.org/whl/cu128
+    --index-url https://download.pytorch.org/whl/cu128 \
+    --break-system-packages
 
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip3 install \
-    tensorrt ultralytics pyzmq numpy PyYAML onnx onnxslim onnxruntime-gpu
+    tensorrt ultralytics pyzmq numpy PyYAML onnx onnxslim onnxruntime-gpu \
+    --break-system-packages
 
 COPY inference_engine/ ./inference_engine/
 
