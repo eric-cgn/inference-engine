@@ -429,7 +429,11 @@ begin queuing in the ROUTER socket rather than being dispatched to the GPU immed
 | **Driver** | 580.159.03 |
 | **Container** | `frigate-inference:sm_75plus` |
 | **Model** | Frigate+ 2020.0 yolo9s base, compiled to FP16 TRT engine |
-| **Config** | `num_workers: 1`, `max_batch: 1`, `precision: fp16` |
+| **Input** | 640×640 |
+| **ZMQ detector entries** | 3 (`zmq0`, `zmq1`, `zmq2`) |
+| **num_workers** | 1 |
+| **max_batch** | 1 (see note below) |
+| **precision** | fp16 |
 | **Cameras** | 11 cameras |
 
 **Sustained throughput (11 cameras, ~5 fps detect per camera):**
@@ -441,6 +445,12 @@ begin queuing in the ROUTER socket rather than being dispatched to the GPU immed
 | Min / Max latency | 5.4 ms / 13.3 ms |
 | Idle (waiting for frames) | ~40% |
 | CPU usage | ~68% of one core |
+
+> **Note on batch size:** `max_batch > 1` is not currently effective with Frigate+ models.
+> Frigate sends one frame per ZMQ request and does not pipeline multiple frames into a
+> single message, so the batch worker always receives a batch of 1. Dynamic batching
+> would require Frigate to submit frames faster than the GPU can drain them, which does
+> not happen in normal single-GPU operation.
 
 The ~20 ms Frigate pipeline overhead is on top of the 7.2 ms GPU time — Frigate's own
 `inference_speed` stat will read closer to 27–30 ms. See the Tuning section for the full
