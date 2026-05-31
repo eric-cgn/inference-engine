@@ -217,18 +217,37 @@ detectors:
   zmq0:
     type: zmq
     endpoint: ipc:///run/zmq/detector.sock
+  # Add more entries to increase throughput — see Tuning section.
   # zmq1:
   #   type: zmq
   #   endpoint: ipc:///run/zmq/detector.sock
+  # zmq2:
+  #   type: zmq
+  #   endpoint: ipc:///run/zmq/detector.sock
 
+# ── Free model (yolo26n auto-downloads on first use) ──────────────────────────
 model:
   path: yolo26n
+  # coco.labels ships with Frigate at /config/model_cache/coco-80.labels,
+  # or download from: https://github.com/nickelc/coco-labels/blob/master/coco.labels
   labelmap_path: /config/coco.labels
   model_type: yolo-generic
   input_tensor: nhwc
   input_pixel_format: rgb
   width: 640
   height: 640
+
+# ── Frigate+ model ────────────────────────────────────────────────────────────
+# Uncomment and replace with your plus:// model URL from the Frigate+ dashboard.
+# Frigate transfers the model to the inference engine automatically on first run.
+# No labelmap needed — Frigate+ models include their own label set.
+# model:
+#   path: plus://your-model-id-here
+#   model_type: yolov8
+#   input_tensor: nchw
+#   input_pixel_format: rgb
+#   width: 640
+#   height: 640
 ```
 
 ## Compose integration
