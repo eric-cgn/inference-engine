@@ -10,11 +10,9 @@ no guarantee of fitness for any purpose. Getting a working sm_61 build together 
 of a PITA that it seemed worth sharing — and these cards are still plenty capable of
 running YOLO `n` and `s` models at useful framerates.
 
-Oh, and I should mention, it was written entirely by Claude and Gemini with very little oversight
-other than a little bit of architectural guidance and some copy-pasting for testing. It
-does work though, and got me off custom Frigate container builds which is very nice QOL
-upgrade. Maybe you find it useful if you're the type that likes keeping old tech doing
-meaningful work.
+AI disclosure: this was written mostly by Claude and Gemini with little oversight. It
+works though, was tested on 1050 and 2060 cards, and got me off custom Frigate container
+builds while maintaining TRT engine performacne, which is very nice QOL upgrade.
 
 ## Why this exists
 
