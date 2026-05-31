@@ -1,9 +1,9 @@
 # Frigate-Compatible ZMQ Inference Pipeliner
 
-A GPU-accelerated inference server that leverages Frigate NVR's built-in ZMQ detector
-support to provide pipelined, dynamically-batching inference, with support for Pascal GPUs.
+**Version: v1.0**
 
-Supports multiple GPU (theoretically), multiple workers per GPU, and dynamic batch sizes.
+A GPU-accelerated TensorRT inference server for Frigate NVR. Provides pipelined inference
+via Frigate's built-in ZMQ detector protocol, with support for Frigate+ models and Pascal GPUs.
 
 This is not part of any official distribution, is not endorsed by anyone, and comes with
 no guarantee of fitness for any purpose. Getting a working sm_61 build together was enough
@@ -18,11 +18,18 @@ meaningful work.
 
 ## Why this exists
 
-**Pascal GPU support.** And for that, it's rather over-engineered. Official PyTorch 2.x wheels do not include
-native code for Pascal GPUs (GTX 1050 Ti, 1060, 1070, 1080 Ti — compute capability sm_6.1).
-This project ships a build pipeline that compiles PyTorch 2.5.1 from source against CUDA 12.2
-for sm_6.1, bringing YOLO26 and Frigate+ models to hardware that would otherwise be left
-behind. Turing and newer (RTX 2060+) work with standard wheels and need no special build.
+**TensorRT inference for Frigate+.** Frigate removed its native TensorRT detector on x86_64
+in recent versions, and the Frigate+ model API does not list `tensorrt` as a supported detector
+type — only `zmq`, `onnx`, `openvino`, `rknn`, and `rocm`. The ZMQ detector is the only
+path to TRT-accelerated inference with Frigate+ models on NVIDIA hardware. This project
+is the ZMQ server on the other end of that socket.
+
+**Pascal GPU support.** The secondary motivation and origin of the project. Official
+PyTorch 2.x wheels do not include native code for Pascal GPUs (GTX 1050 Ti, 1060, 1070,
+1080 Ti — compute capability sm_6.1). This project ships a build pipeline that compiles
+PyTorch 2.5.1 from source against CUDA 12.2 for sm_6.1, bringing YOLO26 and Frigate+
+models to hardware that would otherwise be left behind. Turing and newer (RTX 2060+)
+work with standard wheels and need no special build.
 
 ## Models
 
@@ -35,30 +42,44 @@ headroom for a significant number of cameras at 5 fps detection rates.
 your model and Frigate transfers it to the inference engine automatically over ZMQ on first
 run. No manual file placement needed. See
 [config/frigate-detector.yaml](config/frigate-detector.yaml) for the Frigate config snippet.
+Once transferred, run `tools/optimize.py` to compile it to a TRT engine for maximum
+performance.
 
 Any other YOLO-format model that ultralytics can load (`.pt`, `.onnx`) also works.
 
 ## TensorRT optimization
 
-Compiling to a TensorRT `.engine` file gives a significant speedup (2x on Pascal) because
-TRT generates GPU-native code at compile time rather than interpreting the model graph
-at runtime.
+After the first run, compile the model to a TensorRT `.engine` file. This gives a
+significant speedup (I saw 2x on Pascal) because TRT generates GPU-native code at compile time
+rather than interpreting the model graph at runtime.
 
-With `optimize: always` in `inference.yaml` (the default), the server compiles the engine
-automatically on first use — no manual step required. Compilation blocks inference for
-a few minutes on first run; subsequent starts use the cached engine immediately. A
-per-engine file lock ensures only one worker compiles even when `num_workers > 1`.
-
-To pre-compile before starting the server, or to run a throughput benchmark:
+`run-optimize.sh` runs on the host. It spins up a fresh inference server container,
+waits for the ZMQ socket, then runs `optimize.py` inside a second container against
+the same volumes. Both are torn down on exit and server logs are saved to
+`tools/server_last_run.log`.
 
 ```bash
-./tools/run-optimize.sh yolo26n           # compile (if needed) + benchmark
-./tools/run-optimize.sh yolo26n --test-only  # benchmark only, no compilation
+./tools/run-optimize.sh yolo26n
 ```
 
-`run-optimize.sh` spins up a fresh inference container, waits for the ZMQ socket, runs
-`optimize.py` inside a second container against the same volumes, then tears both down.
-Server logs are saved to `tools/server_last_run.log`.
+For a Frigate+ model (after Frigate has transferred it on first run):
+
+```bash
+./tools/run-optimize.sh your-model-name
+```
+
+After compilation, update your Frigate config to reference the `.engine` file:
+
+```yaml
+model:
+  path: yolo26n.engine
+```
+
+To benchmark without recompiling:
+
+```bash
+./tools/run-optimize.sh yolo26n --test-only
+```
 
 Override the image tag via the `INFERENCE_IMAGE` environment variable if needed:
 
@@ -135,8 +156,8 @@ Also add to your `frigate` service:
 
 #### Turing and newer (RTX 2060, 3060, 3080, 4090, …)
 
-Untested. YMMV. Standard PyTorch wheels work fine on Turing+, so the pipelining
-here may or may not improve your setup over the default Frigate detector.
+Standard PyTorch wheels work fine on Turing+. See the Performance section below for
+measured results on an RTX 2060.
 
 ```bash
 arch/sm_75plus/build.sh
@@ -165,12 +186,8 @@ Keep `precision: fp32` in `inference.yaml` for Pascal — Pascal does not have T
 ```bash
 cd /opt/frigate
 docker compose up -d
+./tools/run-optimize.sh yolo26n
 ```
-
-With `optimize: always` (default), the engine compiles automatically on first use.
-Watch the logs for compilation progress: `docker logs -f frigate-inference`.
-The first request blocks until compilation finishes (typically 1-5 minutes).
-Subsequent starts load the cached `.engine` file immediately.
 
 ## Configuration
 
@@ -186,8 +203,7 @@ variables.
 | `precision` | `fp32` | `fp32` / `fp16` / `bf16` |
 | `engine_type` | `yolo` | Inference backend (only `yolo` currently) |
 | `num_workers` | `1` | Parallel workers (for multi-GPU) |
-| `max_batch_size` | `1` | Maximum frames per GPU batch |
-| `optimize` | `always` | `always` — auto-compile `.engine` on first use; `if_present` — use engine if found, else fall back; `never` — always load the model as named |
+| `max_batch_size` | `16` | Maximum frames per GPU batch |
 
 ## Frigate configuration
 
@@ -204,7 +220,7 @@ detectors:
   #   endpoint: ipc:///run/zmq/detector.sock
 
 model:
-  path: yolo26n
+  path: yolo26n.engine
   labelmap_path: /config/coco.labels
   model_type: yolo-generic
   input_tensor: nhwc
@@ -240,15 +256,16 @@ print(json.loads(sock.recv_multipart()[0]))
 
 ## Architecture
 
+With `num_workers: 1` (default, recommended for a single GPU):
+
 ```
 Frigate cameras
-      │  (multiple REQ sockets, one per detector entry)
+      │  (multiple REQ sockets, one per zmq detector entry)
       ▼
   ZMQ ROUTER socket  ←── frigate-inference container
-      │
-  [broker]  (ROUTER → DEALER, single or multi-worker)
-      │
-  [batch worker(s)]
+      │  (direct bind, no broker)
+      ▼
+  batch worker
       │  phase 1: collect frames into a batch
       │  phase 2: submit batch to GPU (background thread)
       │  phase 3: decode next batch while GPU runs
@@ -257,11 +274,156 @@ Frigate cameras
   YoloEngine (ultralytics → TensorRT)
 ```
 
-Multiple detector entries in Frigate's config map to multiple REQ sockets, all hitting the
-same ROUTER. The broker fans them across workers. Use at least one entry per GPU. Adding
-more may improve throughput by keeping the GPU better fed, or may make no difference —
-it depends on camera count, frame rate, batch size, and GPU speed. For a single GPU,
-`num_workers: 1` is optimal.
+With `num_workers > 1` (multi-GPU), a ROUTER→DEALER broker fans frames across workers.
+For a single GPU, `num_workers: 1` eliminates the broker hop entirely.
+
+Multiple detector entries in Frigate's config (`zmq0`, `zmq1`, …) map to multiple REQ
+sockets all connecting to the same ROUTER. This is distinct from `num_workers` — see
+the Tuning section below.
+
+## Tuning
+
+### Two separate dials
+
+- **`num_workers` in `inference.yaml`** — the number of inference worker processes.
+  One per GPU. More workers on a single GPU do not help and will contend on the CUDA
+  context. Keep this at `1` for a single GPU.
+
+- **zmq detector entries in Frigate's `config.yml`** — the number of parallel ZMQ
+  pipelines Frigate maintains. This is the primary throughput lever. See below.
+
+### Understanding ZMQ latency
+
+Each ZMQ detector entry in Frigate is a **synchronous, blocking pipeline**: it sends one
+frame to the inference engine, waits for the result, then sends the next. While it is
+waiting, no other frame can go through that entry. This means a single entry can only
+sustain:
+
+```
+fps_per_entry = 1000 / cycle_ms
+```
+
+where the **cycle time** is the full round-trip:
+
+```
+cycle_ms = gpu_inference_ms + frigate_overhead_ms
+```
+
+`gpu_inference_ms` is the time the GPU spends on the forward pass. `frigate_overhead_ms`
+is fixed at roughly **20 ms** regardless of GPU speed — it is the cost of Frigate moving
+frames between its internal camera processor subprocesses, queuing them for the detector
+subprocess, and dispatching results back. You cannot reduce this by changing the inference
+engine; it is intrinsic to Frigate's architecture.
+
+**The practical consequence:** a fast GPU does not automatically increase throughput. A
+GPU that runs inference in 7 ms still has a ~27 ms cycle time. One ZMQ entry can only
+push ~37 fps regardless of how fast the GPU is. You need multiple ZMQ entries to keep the
+GPU continuously fed.
+
+### Measuring your actual GPU time
+
+Query the inference engine stats directly:
+
+```bash
+docker exec frigate-inference python3 -c "
+import zmq, json
+ctx = zmq.Context()
+sock = ctx.socket(zmq.DEALER)
+sock.connect('ipc:///run/zmq/detector.sock')
+sock.send_multipart([b'', json.dumps({'stats_request': True}).encode()])
+msg = sock.recv_multipart()
+print(json.dumps(json.loads(msg[-1])['stats']['10s'], indent=2))
+"
+```
+
+The `latency_avg_ms` field is pure GPU time for the inference engine. Compare it to
+Frigate's `inference_speed` stat shown in the Frigate UI — the difference is the Frigate
+overhead for your system.
+
+### Calculating how many ZMQ entries you need
+
+Size N against the GPU's maximum throughput, not your camera count or `detect_fps`
+setting. Frigate submits frames as fast as detections are needed — during active motion
+scenes the rate can far exceed the per-camera fps setting — so a camera-count estimate
+will undersize N when it matters most.
+
+The GPU can theoretically process `1000 / gpu_ms` frames per second if kept fully fed.
+Each ZMQ entry can push at most `1000 / cycle_ms` frames per second. To keep the GPU
+continuously busy:
+
+```
+max_gpu_fps   = 1000 / gpu_inference_ms
+entry_fps     = 1000 / cycle_ms
+N             = ceil( max_gpu_fps / entry_fps )
+              = ceil( cycle_ms / gpu_inference_ms )
+```
+
+**Worked example — RTX 2060, fp16:**
+
+```
+GPU inference latency : 7.2 ms    (from stats)
+Frigate overhead      : ~20 ms    (fixed)
+Cycle time            : ~27 ms
+
+GPU max throughput    : 1000 / 7.2  ≈ 139 fps
+One entry capacity    : 1000 / 27   ≈  37 fps
+
+N = ceil(139 / 37) = ceil(3.75) = 4 entries to fully saturate the GPU
+```
+
+In practice, 3–4 entries covers most single-GPU setups. More than 4–5 is rarely
+beneficial and increases average latency, since frames begin queuing in the ROUTER socket
+rather than being dispatched to the GPU immediately.
+
+### Configuring entries in Frigate
+
+Add one stanza per entry to your Frigate `config.yml`. They all connect to the same
+socket — the inference engine's ROUTER handles them all:
+
+```yaml
+detectors:
+  zmq0:
+    type: zmq
+    endpoint: ipc:///run/zmq/detector.sock
+  zmq1:
+    type: zmq
+    endpoint: ipc:///run/zmq/detector.sock
+  zmq2:
+    type: zmq
+    endpoint: ipc:///run/zmq/detector.sock
+```
+
+A `model:` stanza is shared across all entries — you do not need one per entry.
+
+More than 4–5 entries is rarely beneficial and increases average latency, since frames
+begin queuing in the ROUTER socket rather than being dispatched to the GPU immediately.
+
+## Performance
+
+### RTX 2060 — sm_75plus container
+
+| | |
+|---|---|
+| **GPU** | NVIDIA GeForce RTX 2060 |
+| **Driver** | 580.159.03 |
+| **Container** | `frigate-inference:sm_75plus` |
+| **Model** | Frigate+ 2020.0 yolo9s base, compiled to FP16 TRT engine |
+| **Config** | `num_workers: 1`, `max_batch: 1`, `precision: fp16` |
+| **Cameras** | 11 cameras |
+
+**Sustained throughput (11 cameras, ~5 fps detect per camera):**
+
+| Metric | Value |
+|--------|-------|
+| Throughput | ~84 fps |
+| Avg GPU inference latency | 7.2 ms |
+| Min / Max latency | 5.4 ms / 13.3 ms |
+| Idle (waiting for frames) | ~40% |
+| CPU usage | ~68% of one core |
+
+The ~20 ms Frigate pipeline overhead is on top of the 7.2 ms GPU time — Frigate's own
+`inference_speed` stat will read closer to 27–30 ms. See the Tuning section for the full
+worked example calculating that 3 ZMQ detector entries are the right number for this setup.
 
 ## A Note on the License
 
@@ -269,3 +431,26 @@ FWIW, anything actually copyrightable in this project is licensed
 under [AGPL-3.0](LICENSE) due to its use of
 [Ultralytics](https://github.com/ultralytics/ultralytics), which has produced
 some very cool models and a robust and convenient library.
+
+## Changelog
+
+### v1.0 (2026-05-30)
+
+Performance optimizations to the batch worker and TRT inference path:
+
+- **Pipelined batch worker** — phase 3 decodes the next batch from ZMQ while the GPU is
+  running the current one, eliminating idle time between batches
+- **Float32 NCHW fast path** — Frigate's native float32 NCHW frames skip the CPU
+  uint8→float32 conversion entirely and go directly to the GPU
+- **Pinned memory staging** — uint8/HWC frames use a persistent pinned buffer for async
+  DMA (non-blocking H2D copy), allocated once at engine load
+- **Zero-copy frame passing** — frames decoded from ZMQ are passed directly to the
+  background inference thread as list references; the `np.array()` batch copy is eliminated
+- **Precomputed response headers** — per-frame JSON response headers reduced to a bytes
+  prefix/suffix splice, avoiding `json.dumps` on every result
+- **Safe lazy-reload gating** — model lazy-loads are deferred (not executed) when called
+  from phase 3, preventing any concurrent model reload while inference is in flight
+
+### v0.0
+
+Initial release.

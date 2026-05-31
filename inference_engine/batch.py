@@ -26,7 +26,8 @@ def _base(name: str) -> str:
     return name
 
 
-def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=None):
+def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=None,
+                 allow_lazy_load: bool = True):
     """
     Parse raw ZMQ multipart messages into control replies and inference frames.
     Returns:
@@ -138,6 +139,9 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
                 if (not is_loaded
                         and not getattr(engine, '_compiling', False)
                         and not getattr(engine, '_compile_failed', False)):
+                    if not allow_lazy_load:
+                        deferred.append(msg)
+                        continue
                     logger.info(f"Worker lazily loading active model: {current_model}")
                     engine.load_model(f"{engine.model_dir}/{current_model}")
 
@@ -244,10 +248,9 @@ def run_batch_worker(endpoint: str, engine: InferenceEngine,
         nonlocal inference_thread, inference_result, inference_error
         inference_result = None
         inference_error  = None
-        tensors = np.array(frames)
         inference_thread = threading.Thread(
             target=_run_inference_bg,
-            args=(tensors, list(idents), list(req_ids)),
+            args=(frames, list(idents), list(req_ids)),
             daemon=True,
         )
         inference_thread.start()
@@ -261,12 +264,11 @@ def run_batch_worker(endpoint: str, engine: InferenceEngine,
                 break
         return msgs
 
+    _resp_prefix = f'{{"shape": [{engine.max_dets}, 6], "dtype": "float32", "request_id": '.encode()
+    _resp_suffix = b'}'
+
     def make_resp_header(req_id) -> bytes:
-        return json.dumps({
-            "shape":      [engine.max_dets, 6],
-            "dtype":      "float32",
-            "request_id": req_id,
-        }).encode()
+        return _resp_prefix + (str(req_id).encode() if req_id is not None else b'null') + _resp_suffix
 
     # ── Main loop ────────────────────────────────────────────────────────────
     while True:
@@ -322,7 +324,8 @@ def run_batch_worker(endpoint: str, engine: InferenceEngine,
                 raw_next = drain_socket(max_batch_size - len(next_frames))
                 if raw_next:
                     ctrl, new_idents, new_req_ids, new_frames, more_deferred = _decode_msgs(
-                        raw_next, engine, max_batch_size, stats, shared_model_name
+                        raw_next, engine, max_batch_size, stats, shared_model_name,
+                        allow_lazy_load=False
                     )
                     deferred_msgs.extend(more_deferred)
                     for reply in ctrl:

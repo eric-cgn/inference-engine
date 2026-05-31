@@ -471,12 +471,15 @@ class YoloEngine(InferenceEngine):
         torch.cuda.synchronize()
         return out
 
-    def _run_trt(self, frames_np: np.ndarray) -> np.ndarray:
+    def _run_trt(self, frames_np) -> np.ndarray:
         import torch
         import torch.nn.functional as F
         import torchvision.ops as tvops
 
-        frames = list(frames_np) if frames_np.ndim == 4 else [frames_np]
+        if isinstance(frames_np, np.ndarray):
+            frames = list(frames_np) if frames_np.ndim == 4 else [frames_np]
+        else:
+            frames = frames_np
         batch  = len(frames)
 
         # ── Preprocess ────────────────────────────────────────────────────
@@ -570,8 +573,11 @@ class YoloEngine(InferenceEngine):
 
     # ── Ultralytics fallback ───────────────────────────────────────────────
 
-    def _run_ultralytics(self, frames_np: np.ndarray) -> np.ndarray:
-        frames = list(frames_np) if frames_np.ndim == 4 else [frames_np]
+    def _run_ultralytics(self, frames_np) -> np.ndarray:
+        if isinstance(frames_np, np.ndarray):
+            frames = list(frames_np) if frames_np.ndim == 4 else [frames_np]
+        else:
+            frames = frames_np
         n      = len(frames)
         zeros  = np.zeros((n, self.max_dets, 6), np.float32)
 
