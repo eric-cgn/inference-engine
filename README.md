@@ -49,42 +49,38 @@ Any other YOLO-format model that ultralytics can load (`.pt`, `.onnx`) also work
 
 ## TensorRT optimization
 
-After the first run, compile the model to a TensorRT `.engine` file. This gives a
-significant speedup (I saw 2x on Pascal) because TRT generates GPU-native code at compile time
-rather than interpreting the model graph at runtime.
+TRT compilation happens **automatically on first use** — no manual step required. When
+the inference engine receives a model it hasn't compiled yet, it compiles a `.engine`
+file in the background before serving any inference requests. This gives a significant
+speedup (2x on Pascal) because TRT generates GPU-native code at compile time rather than
+interpreting the model graph at runtime.
 
-`run-optimize.sh` runs on the host. It spins up a fresh inference server container,
-waits for the ZMQ socket, then runs `optimize.py` inside a second container against
-the same volumes. Both are torn down on exit and server logs are saved to
-`tools/server_last_run.log`.
+**Compilation takes 2–10 minutes** depending on the model and GPU. During this time the
+container is running but Frigate detections will not start. This is normal — it is not
+broken. Watch the log to follow progress:
 
 ```bash
-./tools/run-optimize.sh yolo26n
+docker logs -f frigate-inference
 ```
 
-For a Frigate+ model (after Frigate has transferred it on first run):
+You will see output like:
+
+```
+INFO  yolo_engine: Compiling TRT engine for model.onnx → model.engine ...
+INFO  yolo_engine: TRT engine ready — input 'images' [1, 3, 640, 640]
+```
+
+Once the second line appears, the engine is compiled and cached. All subsequent starts
+load the `.engine` file directly and are fast (~1 second).
+
+### run-optimize.sh (optional)
+
+`tools/run-optimize.sh` is still available if you want to pre-compile an engine before
+starting the full stack, or to benchmark with `--test-only`:
 
 ```bash
 ./tools/run-optimize.sh your-model-name
-```
-
-After compilation, update your Frigate config to reference the `.engine` file:
-
-```yaml
-model:
-  path: yolo26n.engine
-```
-
-To benchmark without recompiling:
-
-```bash
-./tools/run-optimize.sh yolo26n --test-only
-```
-
-Override the image tag via the `INFERENCE_IMAGE` environment variable if needed:
-
-```bash
-INFERENCE_IMAGE=frigate-inference:sm_75plus ./tools/run-optimize.sh yolo26n
+./tools/run-optimize.sh your-model-name --test-only
 ```
 
 ## Directory layout
@@ -186,7 +182,13 @@ Keep `precision: fp32` in `inference.yaml` for Pascal — Pascal does not have T
 ```bash
 cd /opt/frigate
 docker compose up -d
-./tools/run-optimize.sh yolo26n
+```
+
+On first start, the inference engine will compile a TRT engine for your model. Watch the
+log and wait for `TRT engine ready` before expecting detections to appear in Frigate:
+
+```bash
+docker logs -f frigate-inference
 ```
 
 ## Configuration
