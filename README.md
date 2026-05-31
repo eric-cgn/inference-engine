@@ -19,10 +19,12 @@ meaningful work.
 ## Why this exists
 
 **TensorRT inference for Frigate+.** Frigate removed its native TensorRT detector on x86_64
-in recent versions, and the Frigate+ model API does not list `tensorrt` as a supported detector
-type — only `zmq`, `onnx`, `openvino`, `rknn`, and `rocm`. The ZMQ detector is the only
-path to TRT-accelerated inference with Frigate+ models on NVIDIA hardware. This project
-is the ZMQ server on the other end of that socket.
+in v0.16.0 — NVIDIA dropped backward compatibility with older TensorRT versions, making it
+too costly to maintain. TensorRT remains available only for Jetson devices. The Frigate+
+model API does not list `tensorrt` as a supported detector type — only `zmq`, `onnx`,
+`openvino`, `rknn`, and `rocm`. The ZMQ detector is the only path to TRT-accelerated
+inference with Frigate+ models on NVIDIA x86_64 hardware. This project is the ZMQ server
+on the other end of that socket.
 
 **Pascal GPU support.** The secondary motivation and origin of the project. Official
 PyTorch 2.x wheels do not include native code for Pascal GPUs (GTX 1050 Ti, 1060, 1070,
