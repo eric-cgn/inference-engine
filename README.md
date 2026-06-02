@@ -1,6 +1,6 @@
 # Frigate-Compatible ZMQ Inference Pipeliner
 
-**Version: [v1.0](CHANGELOG.md)**
+**Version: [v1.1](CHANGELOG.md)**
 
 A GPU-accelerated TensorRT inference server for Frigate NVR. Provides pipelined inference
 via Frigate's built-in ZMQ detector protocol, with support for Frigate+ models and Pascal GPUs.

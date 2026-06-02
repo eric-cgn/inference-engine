@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1 (2026-06-02)
+
+- **CDI-based GPU pinning** — the inference container now reserves its GPU through CDI
+  (`device_ids: ${INFERENCE_CDI_DEVICE}`) instead of the legacy `--gpus`/nvidia-runtime
+  path. CDI records the device in the container's creation spec, so GPU access survives a
+  `systemctl daemon-reload`, which could otherwise strip the device cgroup on a
+  cgroup-v2 + systemd host and silently drop the GPU (NVML "Unknown Error").
+- **`install.sh` CDI setup** — generates/refreshes the CDI spec and interactively prompts
+  for the GPU to pin from `nvidia-ctk cdi list`, writing `INFERENCE_CDI_DEVICE` to `.env`.
+
 ## v1.0 (2026-05-30)
 
 Performance optimizations to the batch worker and TRT inference path:
