@@ -1,6 +1,6 @@
 # Frigate-Compatible ZMQ Inference Pipeliner
 
-**Version: [v1.0](CHANGELOG.md)**
+**Version: [v1.1](CHANGELOG.md)**
 
 A GPU-accelerated TensorRT inference server for Frigate NVR. Provides pipelined inference
 via Frigate's built-in ZMQ detector protocol, with support for Frigate+ models and Pascal GPUs.
@@ -113,9 +113,16 @@ This repo lives alongside your Frigate installation as a peer directory:
 
 ### Prerequisites
 
-- Docker with NVIDIA Container Toolkit
+- Docker with NVIDIA Container Toolkit (>= 1.12 for CDI)
 - Frigate NVR 0.17.1
 - For Pascal builds: a Linux host with `--gpus all` access during the wheel build
+
+The container reserves its GPU through [CDI](https://github.com/cncf-tags/container-device-interface)
+rather than the legacy `--gpus`/nvidia-runtime path. CDI records the device in the
+container's own spec, so GPU access survives a `systemctl daemon-reload` — the legacy
+path can have its device cgroup stripped by a reload and silently lose the GPU until the
+container is recreated. `install.sh` generates the CDI spec and pins the device for you;
+re-run it after a driver upgrade (which rewrites the spec) to refresh the pin.
 
 ### 1. Install
 
@@ -126,8 +133,9 @@ cd /opt/inference-engine
 ```
 
 `install.sh` creates `.env` from `.env.example`, copies `inference.yaml` into your
-Frigate config directory, and prints the `include:` block to add to your Frigate
-`compose.yaml`.
+Frigate config directory, generates the CDI spec and prompts you to pick the GPU to
+pin the inference container to (written to `INFERENCE_CDI_DEVICE` in `.env`), and prints
+the `include:` block to add to your Frigate `compose.yaml`.
 
 Edit `.env` to set your paths and image tag, then add the printed `include:` block
 to the top of your Frigate `compose.yaml`:

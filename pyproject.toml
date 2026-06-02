@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inference-engine"
-version = "0.1.0"
+version = "1.1.0"
 description = "Frigate-compatible ZMQ inference engine w/ pipelined dynamic batching"
 requires-python = ">=3.9"
 dependencies = [
