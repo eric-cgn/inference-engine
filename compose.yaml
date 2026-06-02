@@ -14,6 +14,11 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: 1
+            # Pinned via CDI so GPU access survives `systemctl daemon-reload`
+            # (the legacy --gpus/nvidia-runtime path can lose the device cgroup
+            # and silently drop the GPU until the container is recreated).
+            # install.sh sets INFERENCE_CDI_DEVICE in .env from `nvidia-ctk cdi list`.
+            - driver: cdi
+              device_ids:
+                - ${INFERENCE_CDI_DEVICE:-nvidia.com/gpu=0}
               capabilities: [gpu]
