@@ -13,6 +13,11 @@ _HASH_RE = re.compile(r'^[0-9a-f]{32,}$')
 
 logger = logging.getLogger("yolo_engine")
 
+# Stage uint8 frames through a pinned buffer before the host->device copy.
+# Off by default: benchmarked slower than a direct upload, because the extra
+# host-side copy into the buffer costs more than the async DMA saves.
+_PINNED_STAGING = os.environ.get("PINNED_STAGING", "0").strip().lower() in ("1", "true", "yes", "on")
+
 from ..engine import InferenceEngine
 
 
@@ -742,15 +747,14 @@ class YoloEngine(InferenceEngine):
                 if np.issubdtype(f.dtype, np.integer):
                     if is_chw:
                         f = np.ascontiguousarray(np.transpose(f, (1, 2, 0)))
-                    slot = self._inp_pinned[i] if i < self._inp_pinned.shape[0] else None
-                    if slot is not None and f.shape == tuple(slot.shape):
+                    if _PINNED_STAGING and i < self._inp_pinned.shape[0] \
+                            and f.shape == tuple(self._inp_pinned.shape[1:]):
+                        slot = self._inp_pinned[i]
                         slot.copy_(torch.as_tensor(f))
                         t = (slot.unsqueeze(0)
                                  .to(device="cuda", non_blocking=True)
                                  .float().div_(255.0).permute(0, 3, 1, 2))
                     else:
-                        # Off-size frame (resized below) or batch overflow --
-                        # skip staging rather than mis-shape the copy.
                         t = (torch.as_tensor(np.ascontiguousarray(f), device="cuda")
                                   .float().div_(255.0).permute(2, 0, 1).unsqueeze(0))
                 else:
