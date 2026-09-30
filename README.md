@@ -341,6 +341,7 @@ model:
   labelmap_path: /config/coco.labels
   model_type: yolo-generic
   input_tensor: nhwc
+  input_dtype: int          # see "Wire format" below — Frigate's defaults are the slow path
   input_pixel_format: rgb
   width: 640
   height: 640
@@ -352,11 +353,31 @@ model:
 # model:
 #   path: plus://your-model-id-here
 #   model_type: yolov8
-#   input_tensor: nchw
+#   input_tensor: nhwc
+#   input_dtype: int
 #   input_pixel_format: rgb
 #   width: 640
 #   height: 640
 ```
+
+### Wire format
+
+`input_tensor` and `input_dtype` decide what Frigate puts on the socket, and its
+defaults (`nchw` / `float`) are the slowest combination. Set both explicitly.
+
+With `int`, Frigate ships the raw uint8 frame — 1.23 MB at 640×640×3 — and the ÷255
+happens on the GPU. With `float` it converts to float32 and divides on the CPU first,
+putting 4.92 MB on the socket for the same pixels. Measured with Frigate out of the
+loop, four concurrent clients against one engine:
+
+| | `int` + `nhwc` | `float` + `nchw` | |
+|---|---|---|---|
+| RTX 2060 (TRT 11.3) | **23.0 ms** / 173 fps | 27.6 ms / 144 fps | +17% |
+| GTX 1050 Ti (TRT 8.6.1) | **38.4 ms** / 104 fps | 48.6 ms / 82 fps | +26% |
+
+At a single client the gap is wider — +25% on the 2060, +42% on the 1050 — because the
+per-frame transport cost is a larger share of the total. All three wire formats produce
+identical detections; only the cost differs.
 
 ## Compose integration
 
