@@ -13,11 +13,6 @@ _HASH_RE = re.compile(r'^[0-9a-f]{32,}$')
 
 logger = logging.getLogger("yolo_engine")
 
-# Stage uint8 frames through a pinned buffer before the host->device copy.
-# Off by default: benchmarked slower than a direct upload, because the extra
-# host-side copy into the buffer costs more than the async DMA saves.
-_PINNED_STAGING = os.environ.get("PINNED_STAGING", "0").strip().lower() in ("1", "true", "yes", "on")
-
 from ..engine import InferenceEngine
 
 
@@ -618,7 +613,7 @@ class YoloEngine(InferenceEngine):
         self._nms_in_model = (len(out_shape) == 3 and out_shape[2] == 6)
         logger.info(f"TRT output {out_shape} → {'post-NMS (skipping external NMS)' if self._nms_in_model else 'raw head (applying external NMS)'}")
 
-        self._ensure_gpu_staging()
+        self._ensure_stream()
 
         # Warm-up
         dummy = torch.zeros(1, 3, self._inp_h, self._inp_w, device="cuda")
@@ -650,25 +645,15 @@ class YoloEngine(InferenceEngine):
 
     # ── Direct TRT path ────────────────────────────────────────────────────
 
-    def _ensure_gpu_staging(self):
-        """Allocate the preprocessing stream and pinned staging buffer.
+    def _ensure_stream(self):
+        """Create the dedicated preprocessing stream.
 
-        Lazy so that callers which set up _inp_h/_inp_w without going through
+        Lazy so that callers which set _inp_h/_inp_w without going through
         _load_trt_direct (the unit tests) still work.
-
-        The pinned buffer has one slot per batch position on purpose. A pinned
-        buffer makes the host->device copy asynchronous, but `copy_` into it is
-        a *host* operation and is not ordered against the stream, so a single
-        shared slot lets frame N+1 overwrite the staging bytes while frame N's
-        DMA is still in flight.
         """
         import torch
         if getattr(self, "_stream", None) is None:
             self._stream = torch.cuda.Stream()
-        want = (max(1, self.max_batch_size), self._inp_h, self._inp_w, 3)
-        pinned = getattr(self, "_inp_pinned", None)
-        if pinned is None or tuple(pinned.shape) != want:
-            self._inp_pinned = torch.empty(*want, dtype=torch.uint8).pin_memory()
 
     def _trt_forward(self, inp: "torch.Tensor") -> "torch.Tensor":
         """Execute the TRT engine on an (N,3,H,W) CUDA tensor."""
@@ -726,37 +711,29 @@ class YoloEngine(InferenceEngine):
         #   float32 CHW  uploaded to the GPU as-is. For input_dtype: float the
         #                pixels are already normalised, so the CPU never touches
         #                them -- no transpose, no uint8 round trip.
-        #   uint8        staged through a pinned buffer so the host->device copy
-        #                is asynchronous, then scaled on the GPU.
-        #   float32 HWC  uploaded directly and permuted on the GPU. It must not
-        #                use the pinned buffer, which is uint8 and would truncate
-        #                0-1 values to zero -- a black frame.
+        #   uint8        uploaded directly and scaled on the GPU. Staging this
+        #                through a pinned buffer was benchmarked and is slower:
+        #                the extra host-side copy costs more than the async DMA
+        #                saves.
+        #   float32 HWC  uploaded directly and permuted on the GPU.
         #
         # Normalization follows the wire dtype rather than pixel values: a
         # near-black uint8 frame reads as already-normalised to a value sniff,
         # which would skip the divide and hand the model a 255x over-bright
         # image. The float paths keep a value check so Frigate's float_denorm
         # mode, which sends float32 still in 0-255, is scaled correctly.
-        self._ensure_gpu_staging()
+        self._ensure_stream()
         with torch.cuda.stream(self._stream):
             tensors = []
-            for i, f in enumerate(frames):
+            for f in frames:
                 is_chw = (f.ndim == 3 and f.shape[0] in (1, 3)
                           and f.shape[0] < f.shape[1] and f.shape[0] < f.shape[2])
 
                 if np.issubdtype(f.dtype, np.integer):
                     if is_chw:
                         f = np.ascontiguousarray(np.transpose(f, (1, 2, 0)))
-                    if _PINNED_STAGING and i < self._inp_pinned.shape[0] \
-                            and f.shape == tuple(self._inp_pinned.shape[1:]):
-                        slot = self._inp_pinned[i]
-                        slot.copy_(torch.as_tensor(f))
-                        t = (slot.unsqueeze(0)
-                                 .to(device="cuda", non_blocking=True)
-                                 .float().div_(255.0).permute(0, 3, 1, 2))
-                    else:
-                        t = (torch.as_tensor(np.ascontiguousarray(f), device="cuda")
-                                  .float().div_(255.0).permute(2, 0, 1).unsqueeze(0))
+                    t = (torch.as_tensor(np.ascontiguousarray(f), device="cuda")
+                              .float().div_(255.0).permute(2, 0, 1).unsqueeze(0))
                 else:
                     t = torch.as_tensor(np.ascontiguousarray(f), device="cuda").float()
                     t = t.unsqueeze(0) if is_chw else t.permute(2, 0, 1).unsqueeze(0)
