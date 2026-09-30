@@ -88,8 +88,13 @@ Performance optimizations to the batch worker and TRT inference path:
   running the current one, eliminating idle time between batches
 - **Float32 NCHW fast path** — Frigate's native float32 NCHW frames skip the CPU
   uint8→float32 conversion entirely and go directly to the GPU
+  *(correction: this never made it into the repository — only the `batch.py` half of this
+  release was committed. It landed for real in v1.2.)*
 - **Pinned memory staging** — uint8/HWC frames use a persistent pinned buffer for async
   DMA (non-blocking H2D copy), allocated once at engine load
+  *(correction: also never committed, and not adopted in v1.2 — benchmarking showed it
+  costs ~6% on uint8 frames, because the host-side copy into the buffer outweighs what the
+  asynchronous transfer saves.)*
 - **Zero-copy frame passing** — frames decoded from ZMQ are passed directly to the
   background inference thread as list references; the `np.array()` batch copy is eliminated
 - **Precomputed response headers** — per-frame JSON response headers reduced to a bytes
