@@ -341,20 +341,34 @@ class YoloEngine(InferenceEngine):
         w = _static_dim(inp_shape.dim[3]) or 640
         logger.info(f"ONNX input spatial size: {h}×{w}")
 
+        # Convert weights to FP16 before compilation — TRT 11+ removed the FP16
+        # builder flag; the correct approach is to lower the ONNX model to FP16
+        # so TRT sees native FP16 weights and uses Tensor Cores automatically.
+        if self.precision in ("fp16", "bf16"):
+            from onnxconverter_common import float16
+            logger.info(f"Converting ONNX weights to FP16 for TRT compilation (precision={self.precision})")
+            onnx_model = float16.convert_float_to_float16(onnx_model, keep_io_types=True)
+            # Re-read spatial dims after conversion (shape metadata unchanged)
+
         if not is_dynamic:
             logger.info("Static batch ONNX — patching to dynamic for TRT optimization profile")
             model_dyn = copy.deepcopy(onnx_model)
             for t in list(model_dyn.graph.input) + list(model_dyn.graph.output):
-                t.type.tensor_type.shape.dim[0].dim_param = "batch"
+                dim = t.type.tensor_type.shape.dim[0]
+                dim.ClearField("dim_value")   # must clear static value before setting dynamic
+                dim.dim_param = "batch"
             dyn_path = source_path + ".dyn.onnx"
             onnx.save(model_dyn, dyn_path)
+            source_path = dyn_path
+        elif self.precision in ("fp16", "bf16"):
+            # Dynamic already but weights changed — save patched model
+            dyn_path = source_path + ".dyn.onnx"
+            onnx.save(onnx_model, dyn_path)
             source_path = dyn_path
 
         logger_trt = trt.Logger(trt.Logger.WARNING)
         builder    = trt.Builder(logger_trt)
-        network    = builder.create_network(
-            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        )
+        network    = builder.create_network(0)
         parser = trt.OnnxParser(network, logger_trt)
         with open(source_path, "rb") as f:
             if not parser.parse(f.read()):
@@ -363,8 +377,6 @@ class YoloEngine(InferenceEngine):
 
         config = builder.create_builder_config()
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 * 1024 ** 3)
-        if self.precision == "fp16":
-            config.set_flag(trt.BuilderFlag.FP16)
 
         profile = builder.create_optimization_profile()
         inp = network.get_input(0)
@@ -491,7 +503,14 @@ class YoloEngine(InferenceEngine):
                 f = np.transpose(f, (1, 2, 0))
                 if f.dtype in (np.float32, np.float64):
                     f = (f * 255).clip(0, 255).astype(np.uint8)
-            t = torch.as_tensor(f.copy(), device="cuda").float().div_(255.0)
+            t = torch.as_tensor(f.copy(), device="cuda").float()
+            # Decide normalization from the wire dtype, not from pixel values.
+            # A near-black uint8 frame (max <= 1) reads as already-normalized to a
+            # value sniff, which silently skips the divide — a 255x brightness error.
+            if np.issubdtype(f.dtype, np.integer):
+                t.div_(255.0)                # uint8 0-255 (Frigate input_dtype: int)
+            elif t.max() > 1.5:              # float_denorm: float32 still in 0-255
+                t.div_(255.0)
             t = t.permute(2, 0, 1).unsqueeze(0)   # (1, C, H, W)
             tensors.append(t)
 

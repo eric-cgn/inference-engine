@@ -20,7 +20,7 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip3 install \
-    tensorrt ultralytics pyzmq numpy PyYAML onnx onnxslim onnxruntime-gpu \
+    tensorrt ultralytics pyzmq numpy PyYAML onnx onnxslim onnxruntime-gpu onnxconverter-common \
     --break-system-packages
 
 COPY inference_engine/ ./inference_engine/
