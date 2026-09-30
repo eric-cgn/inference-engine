@@ -379,6 +379,14 @@ At a single client the gap is wider — +25% on the 2060, +42% on the 1050 — b
 per-frame transport cost is a larger share of the total. All three wire formats produce
 identical detections; only the cost differs.
 
+**Frigate+ models ignore these settings.** Their metadata carries `inputShape` and
+`inputDataType`, and Frigate applies those after your config, so neither the `model:`
+block nor a per-detector `model:` override changes the resolved wire format. A `plus://`
+model uses whatever it was published with — commonly `nchw` + `float`. That path is not
+slow: it is exactly what the float32 NCHW fast path exists to accelerate, uploading the
+frame to the GPU with no CPU conversion at all. The table above applies to local models
+(`yolo26n`, your own `.onnx`), where the setting is yours to choose.
+
 ## Compose integration
 
 The `frigate-inference` service and shared `zmq_ipc` volume are defined in

@@ -35,6 +35,13 @@ model:
   #   GTX 1050 Ti        38.4 ms         48.6 ms      (+26%)
   #
   # At a single client the gap is wider still: +25% on the 2060, +42% on the 1050.
+  #
+  # Frigate+ models are the exception: their metadata carries inputShape and
+  # inputDataType, and Frigate applies those *after* this file, so setting them
+  # here has no effect. Verified against a plus:// model -- neither this block
+  # nor a per-detector model: override changed the resolved config. Those models
+  # use whatever wire format they were published with (commonly nchw + float),
+  # and the engine's float32 NCHW fast path is what accelerates that case.
   input_tensor: nhwc
   input_dtype: int
   input_pixel_format: rgb
