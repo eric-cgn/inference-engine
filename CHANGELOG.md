@@ -2,7 +2,7 @@
 
 ## v1.2 (2026-09-30)
 
-> **Upgrading:** `sm_75plus` moves from TensorRT 10 to 11.3. Serialized engines are not
+> **Upgrading:** `sm_75_121` moves from TensorRT 10 to 11.3. Serialized engines are not
 > portable across TensorRT versions, so every existing `.engine` is invalidated and will
 > be recompiled on first use — detection is unavailable for a few minutes per model while
 > that runs. `sm_61` is unaffected.
@@ -25,13 +25,13 @@
   - `PASCAL_COMPAT=1` (sm_61, TRT 8.6.1) — `EXPLICIT_BATCH` network, precision via
     `BuilderFlag.FP16`. Also enforces fp32, since Pascal has no Tensor Cores and runs
     FP16 at 1/64 rate.
-  - `PASCAL_COMPAT=0` (sm_75plus, TRT 11.3) — strongly-typed network, FP16 from the
+  - `PASCAL_COMPAT=0` (sm_75_121, TRT 11.3) — strongly-typed network, FP16 from the
     lowered graph.
 - **Precision is enforced against the hardware** — BF16 requires Ampere (8.0); an
   RTX 2060 (7.5) cannot execute it. Unsupported precisions now downgrade with a
   warning instead of silently building an engine labelled with a precision it does
   not have.
-- **TensorRT version pinned for sm_75plus** (`tensorrt==11.3.0.99`) — unpinned, a
+- **TensorRT version pinned for sm_75_121** (`tensorrt==11.3.0.99`) — unpinned, a
   rebuild silently changed TRT major version, which switches the required API *and*
   invalidates every cached `.engine`.
 - **Engine cache tracks the TRT version** — engines are not portable across TensorRT

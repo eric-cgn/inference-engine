@@ -23,7 +23,7 @@ Run from the repo root inside the inference image:
 
     docker run --rm --device nvidia.com/gpu=0 \
         -v /media/raid10/inference-engine:/app \
-        frigate-inference:sm_75plus \
+        frigate-inference:sm_75_121 \
         python3 -m unittest discover -s tests -t .
 """
 import os

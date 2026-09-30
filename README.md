@@ -100,7 +100,7 @@ This repo lives alongside your Frigate installation as a peer directory:
 ├── .env.example
 ├── arch/
 │   ├── sm_61/                  ← Pascal build
-│   └── sm_75plus/              ← Turing+ build
+│   └── sm_75_121/              ← Turing+ build
 ├── config/
 │   └── inference.yaml          ← template
 ├── inference_engine/
@@ -114,26 +114,49 @@ This repo lives alongside your Frigate installation as a peer directory:
 Two images, split by GPU generation. The split is structural, not a packaging choice:
 TensorRT 11's floor is SM 7.5 and Pascal is SM 6.1, so no single TensorRT can serve both.
 
-| Generation | SM | Consumer cards | Image | Min driver | Precisions |
+| Generation | SM | Consumer cards | Image | Driver range | Precisions |
 |---|---|---|---|---|---|
 | Maxwell | 5.0–5.2 | GTX 750 Ti, 950, 960, 970, 980, 980 Ti, TITAN X | — | — | not supported |
-| **Pascal** | **6.1** | GT 1030, GTX 1050, 1050 Ti, 1060, 1070, 1070 Ti, 1080, 1080 Ti, TITAN X (Pascal), TITAN Xp | **`sm_61`** | **≥ 525** | fp32 |
+| **Pascal** | **6.1** | GT 1030, GTX 1050, 1050 Ti, 1060, 1070, 1070 Ti, 1080, 1080 Ti, TITAN X (Pascal), TITAN Xp | **`sm_61`** ¹ | **525 – 580.x** ² | fp32 |
 | Volta | 7.0 | TITAN V only — no GeForce part shipped on Volta | — | — | not supported |
-| **Turing** | **7.5** | GTX 1650, 1650 Super, 1660, 1660 Super, 1660 Ti, RTX 2060, 2060 Super, 2070, 2070 Super, 2080, 2080 Super, 2080 Ti, TITAN RTX | **`sm_75plus`** | **≥ 570** | fp32, fp16 |
-| **Ampere** | **8.6** | RTX 3050, 3060, 3060 Ti, 3070, 3070 Ti, 3080, 3080 Ti, 3090, 3090 Ti | **`sm_75plus`** | **≥ 570** | fp32, fp16, bf16 |
-| **Ada Lovelace** | **8.9** | RTX 4060, 4060 Ti, 4070, 4070 Super, 4070 Ti, 4070 Ti Super, 4080, 4080 Super, 4090 | **`sm_75plus`** | **≥ 570** | fp32, fp16, bf16 |
-| **Blackwell** | **12.0** | RTX 5060, 5060 Ti, 5070, 5070 Ti, 5080, 5090 | **`sm_75plus`** | **≥ 570** | fp32, fp16, bf16 |
+| **Turing** | **7.5** | GTX 1650, 1650 Super, 1660, 1660 Super, 1660 Ti, RTX 2060, 2060 Super, 2070, 2070 Super, 2080, 2080 Super, 2080 Ti, TITAN RTX | **`sm_75_121`** | **≥ 570** | fp32, fp16 |
+| **Ampere** | **8.6** | RTX 3050, 3060, 3060 Ti, 3070, 3070 Ti, 3080, 3080 Ti, 3090, 3090 Ti | **`sm_75_121`** | **≥ 570** | fp32, fp16, bf16 |
+| **Ada Lovelace** | **8.9** | RTX 4060, 4060 Ti, 4070, 4070 Super, 4070 Ti, 4070 Ti Super, 4080, 4080 Super, 4090 | **`sm_75_121`** | **≥ 570** | fp32, fp16, bf16 |
+| **Blackwell** | **12.0** | RTX 5060, 5060 Ti, 5070, 5070 Ti, 5080, 5090 | **`sm_75_121`** | **≥ 570** | fp32, fp16, bf16 |
+| **Rubin** | **10.7** | unreleased | — ³ | — | needs a cu13 image |
+| Feynman | — | future | — ³ | — | needs a cu13 image |
 
 Both images are CUDA 12, but on different minor versions, which is where the two driver
-minimums come from:
+floors come from:
 
-| | `sm_61` | `sm_75plus` |
+| | `sm_61` | `sm_75_121` |
 |---|---|---|
 | Base image | `nvidia/cuda:12.2.2` | `nvidia/cuda:12.8.1` |
 | TensorRT | 8.6.1 (pinned) | 11.3.0.99 cu12 (pinned) |
 | PyTorch | 2.5.1, built from source for sm_61 | 2.11.0+cu128 (stock wheels) |
+| Compiled arches | `sm_61` only | `sm_75 sm_80 sm_86 sm_90 sm_100 sm_120` |
 | Compilation model | Weak typing (`PASCAL_COMPAT=1`) | Strong typing (`PASCAL_COMPAT=0`) |
 | Build time | 1–3 h (compiles PyTorch) | ~12 min |
+
+¹ The `sm_61` image also carries CUDA 11 libraries (`nvidia-cublas-cu11`,
+`nvidia-cuda-runtime-cu11`, and friends) because `onnxruntime-gpu 1.18.1` requires them.
+They are only reachable on the Ultralytics fallback path and are never used by the
+TensorRT path, but it means that image is not purely CUDA 12.
+
+² Pascal is the only row with an *upper* bound. Driver branch 580 is the last to support
+Maxwell, Pascal and Volta; 590 and later drop them. Once your host moves past 580.x, the
+`sm_61` image stops working and the card is done, independently of anything in this repo.
+Every other row is open-ended.
+
+³ The image is named for the range it actually covers rather than `sm_75plus`, because
+"plus" is a promise CUDA 12 cannot keep. A cu12 toolkit can only target architectures that
+existed when it shipped, so Rubin and later need a separate cu13-based image — a new
+`arch/` tier, not a rebuild of this one. The `121` upper bound reflects that `sm_120`
+cubins run on `sm_121` by minor-version compatibility.
+
+Read the bound as "what CUDA 12 can build", not as a numeric span: compute capabilities
+are not chronological, so Rubin's **10.7** falls *inside* 7.5–12.1 while still being
+outside what this image can target.
 
 **Not supported.** Maxwell and older are below the floor of the PyTorch wheels the `sm_61`
 image is built with (`TORCH_CUDA_ARCH_LIST=6.1`, no PTX, so there is no JIT fallback).
@@ -194,16 +217,16 @@ Also add to your `frigate` service:
 
 ### 2. Build the image
 
-#### Turing and newer — `sm_75plus`
+#### Turing and newer — `sm_75_121`
 
 For any card in the Turing, Ampere, Ada or Blackwell rows of the matrix above. Stock
 PyTorch wheels cover sm_75 through sm_120, so there is nothing to compile.
 
 ```bash
-arch/sm_75plus/build.sh
+arch/sm_75_121/build.sh
 ```
 
-Set `INFERENCE_IMAGE=frigate-inference:sm_75plus` in `.env`.
+Set `INFERENCE_IMAGE=frigate-inference:sm_75_121` in `.env`.
 
 #### Pascal — `sm_61`
 
@@ -279,7 +302,7 @@ installed there:
 | Image | TensorRT | `PASCAL_COMPAT` | Compilation model |
 |---|---|---|---|
 | `sm_61` | 8.6.1 (pinned) | `1` | Weak typing — `EXPLICIT_BATCH` network, precision via `BuilderFlag` |
-| `sm_75plus` | 11.3.0.99 (pinned) | `0` | Strong typing — precision carried by the ONNX graph |
+| `sm_75_121` | 11.3.0.99 (pinned) | `0` | Strong typing — precision carried by the ONNX graph |
 
 The two APIs are mutually exclusive: TRT 11 removed the per-precision `BuilderFlag`s,
 and on TRT 8 the strongly-typed call selects *implicit* batch, which the ONNX parser
@@ -505,13 +528,13 @@ begin queuing in the ROUTER socket rather than being dispatched to the GPU immed
 
 ## Performance
 
-### RTX 2060 — sm_75plus container
+### RTX 2060 — sm_75_121 container
 
 | | |
 |---|---|
 | **GPU** | NVIDIA GeForce RTX 2060 |
 | **Driver** | 580.159.03 |
-| **Container** | `frigate-inference:sm_75plus` |
+| **Container** | `frigate-inference:sm_75_121` |
 | **Model** | Frigate+ 2020.0 yolo9s base, compiled to FP16 TRT engine |
 | **Input** | 640×640 |
 | **ZMQ detector entries** | 3 (`zmq0`, `zmq1`, `zmq2`) |
