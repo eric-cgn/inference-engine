@@ -18,13 +18,20 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     --index-url https://download.pytorch.org/whl/cu128 \
     --break-system-packages
 
+# TensorRT is pinned. Unpinned, a rebuild silently jumps TRT major version,
+# which changes the builder API *and* invalidates every cached .engine, since
+# engines are not portable across TRT serialization versions. Changing this pin
+# requires reviewing the PASCAL_COMPAT codepaths in yolo_engine.py.
+#
+# The -cu12 variant is selected explicitly. The plain `tensorrt` meta-package
+# resolves to -cu13, putting a CUDA 13 build on this CUDA 12.8 base next to a
+# cu128 torch. That does run -- TensorRT links the CUDA driver API rather than
+# the runtime, so it uses whichever runtime is present -- but CUDA 13 requires
+# driver >= 580, needlessly raising the minimum driver for an image whose every
+# other component is CUDA 12.
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip3 install \
-# tensorrt is pinned: an unpinned rebuild silently jumps TRT major version,
-# which changes the builder API *and* invalidates every cached .engine
-# (engines are not portable across TRT serialization versions).
-# Changing this pin requires reviewing PASCAL_COMPAT codepaths in yolo_engine.py.
-    tensorrt==11.3.0.99 \
+    tensorrt-cu12==11.3.0.99 \
     ultralytics pyzmq numpy PyYAML onnx onnxslim onnxruntime-gpu onnxconverter-common \
     --break-system-packages
 
