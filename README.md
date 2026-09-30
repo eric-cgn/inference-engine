@@ -123,8 +123,7 @@ TensorRT 11's floor is SM 7.5 and Pascal is SM 6.1, so no single TensorRT can se
 | **Ampere** | **8.6** | RTX 3050, 3060, 3060 Ti, 3070, 3070 Ti, 3080, 3080 Ti, 3090, 3090 Ti | **`sm_75_121`** | **≥ 570** | fp32, fp16, bf16 |
 | **Ada Lovelace** | **8.9** | RTX 4060, 4060 Ti, 4070, 4070 Super, 4070 Ti, 4070 Ti Super, 4080, 4080 Super, 4090 | **`sm_75_121`** | **≥ 570** | fp32, fp16, bf16 |
 | **Blackwell** | **12.0** | RTX 5060, 5060 Ti, 5070, 5070 Ti, 5080, 5090 | **`sm_75_121`** | **≥ 570** | fp32, fp16, bf16 |
-| **Rubin** | **10.7** | unreleased | — ³ | — | needs a cu13 image |
-| Feynman | — | future | — ³ | — | needs a cu13 image |
+| Post-Blackwell | — | none yet — Rubin and later are datacenter-first | — ³ | — | would need a cu13 image |
 
 Both images are CUDA 12, but on different minor versions, which is where the two driver
 floors come from:
@@ -154,9 +153,11 @@ existed when it shipped, so Rubin and later need a separate cu13-based image —
 `arch/` tier, not a rebuild of this one. The `121` upper bound reflects that `sm_120`
 cubins run on `sm_121` by minor-version compatibility.
 
-Read the bound as "what CUDA 12 can build", not as a numeric span: compute capabilities
-are not chronological, so Rubin's **10.7** falls *inside* 7.5–12.1 while still being
-outside what this image can target.
+No consumer part has landed above `sm_121` yet — Rubin and its successors are
+datacenter-first — so the bound holds for every card in the table above. It is a
+statement about what CUDA 12 can target, not a guarantee about numbering: compute
+capabilities are not strictly chronological, and a future consumer part could land
+anywhere.
 
 **Not supported.** Maxwell and older are below the floor of the PyTorch wheels the `sm_61`
 image is built with (`TORCH_CUDA_ARCH_LIST=6.1`, no PTX, so there is no JIT fallback).
