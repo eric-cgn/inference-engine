@@ -13,9 +13,27 @@ _DEFAULTS = {
     "num_workers":    1,
     "max_batch_size": 1,
     "optimize":       "always",
+    "pascal_compat":  False,
 }
 
 _VALID_OPTIMIZE = {"always", "if_present", "never"}
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSEY = {"0", "false", "no", "off", ""}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var, warning (not raising) on an unrecognised value."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in _TRUTHY:
+        return True
+    if v in _FALSEY:
+        return False
+    logger.warning(f"{name}='{raw}' is not a boolean — using default {default}")
+    return default
 
 
 class ServerConfig:
@@ -30,6 +48,14 @@ class ServerConfig:
         self.max_batch_size = int(os.environ.get("MAX_BATCH_SIZE", _DEFAULTS["max_batch_size"]))
         self.optimize       = os.environ.get("OPTIMIZE",     _DEFAULTS["optimize"])
         self.max_dets       = 20
+
+        # PASCAL_COMPAT selects the TensorRT compilation model (see engine.py).
+        # Deliberately env-only and NOT overridable from inference.yaml: it is a
+        # property of the image (which TRT is installed), not a user preference.
+        # Both Dockerfiles set it, so it is always present in a container; the
+        # default below only applies to bare checkouts, and is verified against
+        # the TRT actually installed by YoloEngine's startup validation.
+        self.pascal_compat  = _env_bool("PASCAL_COMPAT", _DEFAULTS["pascal_compat"])
 
         # backend_endpoint is an internal ZMQ detail, not user-facing.
         # Always inproc:// — workers and broker share the same container and context.
@@ -69,4 +95,5 @@ class ServerConfig:
             "num_workers": self.num_workers,
             "max_batch":   self.max_batch_size,
             "optimize":    self.optimize,
+            "pascal_compat": self.pascal_compat,
         }

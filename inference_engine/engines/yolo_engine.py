@@ -38,6 +38,84 @@ class YoloEngine(InferenceEngine):
     # ── Shared TRT runtime (one per process) ──────────────────────────────
     _trt_runtime = None
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._validate_trt_profile()
+
+    def _validate_trt_profile(self):
+        """
+        Verify PASCAL_COMPAT agrees with the TensorRT that is actually installed.
+
+        PASCAL_COMPAT is declared per-image in the Dockerfile rather than sniffed
+        at runtime, so the active compilation model is explicit and greppable.
+        This check exists so that a mismatch fails immediately and legibly,
+        instead of surfacing later as an opaque ONNX parse error inside a
+        background compile thread.
+
+        It keys on the TRT version, not on the GPU: running the sm_61 image on a
+        Turing card is a legitimate fallback, and PASCAL_COMPAT=1 is still
+        correct there, because what the flag really selects is which TRT API
+        generation to drive.
+
+            PASCAL_COMPAT=1  needs TRT < 11  (BuilderFlag precision still exists)
+            PASCAL_COMPAT=0  needs TRT >= 10 (create_network(0) == explicit batch)
+
+        TRT 10 satisfies both and is accepted either way.
+        """
+        try:
+            import tensorrt as trt
+        except ImportError:
+            return   # Ultralytics-only fallback; no TRT path to validate
+
+        try:
+            major = int(trt.__version__.split(".")[0])
+        except (ValueError, AttributeError):
+            logger.warning(
+                "Could not parse the installed TensorRT version — "
+                "skipping PASCAL_COMPAT validation"
+            )
+            return
+
+        if self.pascal_compat and major >= 11:
+            raise RuntimeError(
+                f"PASCAL_COMPAT=1 but TensorRT {trt.__version__} is installed. "
+                f"TRT 11 removed the per-precision BuilderFlags that this path "
+                f"depends on. Set PASCAL_COMPAT=0 in the Dockerfile for this image."
+            )
+        if not self.pascal_compat and major < 10:
+            raise RuntimeError(
+                f"PASCAL_COMPAT=0 but TensorRT {trt.__version__} is installed. "
+                f"On TRT 8, create_network(0) selects implicit batch, which the "
+                f"ONNX parser rejects. Set PASCAL_COMPAT=1 in the Dockerfile for "
+                f"this image."
+            )
+
+        if self.precision == "bf16" and not self.pascal_compat:
+            # onnxconverter-common lowers only to IEEE half, and TRT 11 has no
+            # BF16 builder flag, so no path here produces a genuinely BF16
+            # engine. Record what is actually built rather than labelling an
+            # FP16 engine "bf16" -- _check_engine compares that string, so a
+            # wrong label would silently never trigger a rebuild.
+            logger.warning(
+                "precision='bf16' has no supported TRT compile path — building fp16 instead"
+            )
+            self.precision = "fp16"
+
+        logger.info(
+            f"TRT profile: PASCAL_COMPAT={int(self.pascal_compat)} "
+            f"(tensorrt {trt.__version__}, "
+            f"{'weak typing / BuilderFlag' if self.pascal_compat else 'strongly typed / ONNX-lowered'})"
+        )
+
+    @staticmethod
+    def _trt_version() -> str:
+        """Installed TensorRT version, or '' when TRT is unavailable."""
+        try:
+            import tensorrt as trt
+            return str(trt.__version__)
+        except Exception:
+            return ""
+
     @classmethod
     def _get_runtime(cls):
         if cls._trt_runtime is None:
@@ -240,6 +318,20 @@ class YoloEngine(InferenceEngine):
             return ("recompile",
                     f"precision changed {meta.get('precision')} → {self.precision}")
 
+        # A serialized engine can only be deserialized by the TRT version that
+        # built it. Without this check a TRT upgrade yields "use", and the
+        # deserialize then fails at load time with detection already offline.
+        stored_trt  = meta.get("trt_version", "")
+        current_trt = self._trt_version()
+        if not stored_trt:
+            return ("recompile",
+                    "engine predates TRT version tracking — rebuilding to "
+                    "guarantee it matches the installed TensorRT")
+        if current_trt and stored_trt != current_trt:
+            return ("recompile",
+                    f"TensorRT changed {stored_trt} → {current_trt} "
+                    f"(engines are not portable across TRT versions)")
+
         if source_path and os.path.exists(source_path):
             current = self._sha256(source_path)
             stored  = meta.get("model_hash", "")
@@ -262,6 +354,9 @@ class YoloEngine(InferenceEngine):
             "engine_batch": self.max_batch_size,
             "precision":    self.precision,
             "engine_type":  "yolo",
+            # Serialized engines are not portable across TRT versions; record
+            # which one built this so _check_engine can force a rebuild.
+            "trt_version":  self._trt_version(),
         }
         tmp = meta_path + ".tmp"
         with open(tmp, "w") as f:
@@ -341,34 +436,53 @@ class YoloEngine(InferenceEngine):
         w = _static_dim(inp_shape.dim[3]) or 640
         logger.info(f"ONNX input spatial size: {h}×{w}")
 
-        # Convert weights to FP16 before compilation — TRT 11+ removed the FP16
-        # builder flag; the correct approach is to lower the ONNX model to FP16
-        # so TRT sees native FP16 weights and uses Tensor Cores automatically.
-        if self.precision in ("fp16", "bf16"):
+        # How precision reaches the engine depends on the TRT generation that
+        # this image ships (see PASCAL_COMPAT in the Dockerfiles):
+        #
+        #   PASCAL_COMPAT=1 (TRT 8)  weak typing. The graph stays FP32 and a
+        #       BuilderFlag *permits* the builder to select FP16 kernels. Set
+        #       further down, next to the builder config.
+        #   PASCAL_COMPAT=0 (TRT 11) strong typing. The per-precision
+        #       BuilderFlags were removed, so precision has to come from the
+        #       graph itself: lower the weights to FP16 and keep FP32 I/O so
+        #       the preprocessing path in _run_trt is unaffected.
+        lower_to_fp16 = (not self.pascal_compat) and self.precision == "fp16"
+        if lower_to_fp16:
             from onnxconverter_common import float16
-            logger.info(f"Converting ONNX weights to FP16 for TRT compilation (precision={self.precision})")
+            logger.info("Lowering ONNX weights to FP16 for strongly-typed TRT build")
             onnx_model = float16.convert_float_to_float16(onnx_model, keep_io_types=True)
-            # Re-read spatial dims after conversion (shape metadata unchanged)
 
         if not is_dynamic:
             logger.info("Static batch ONNX — patching to dynamic for TRT optimization profile")
             model_dyn = copy.deepcopy(onnx_model)
             for t in list(model_dyn.graph.input) + list(model_dyn.graph.output):
-                dim = t.type.tensor_type.shape.dim[0]
-                dim.ClearField("dim_value")   # must clear static value before setting dynamic
-                dim.dim_param = "batch"
+                # dim_value and dim_param are a protobuf oneof, so assigning
+                # dim_param already clears dim_value. An explicit ClearField
+                # here produces byte-identical output; don't re-add it.
+                t.type.tensor_type.shape.dim[0].dim_param = "batch"
             dyn_path = source_path + ".dyn.onnx"
             onnx.save(model_dyn, dyn_path)
             source_path = dyn_path
-        elif self.precision in ("fp16", "bf16"):
-            # Dynamic already but weights changed — save patched model
+        elif lower_to_fp16:
+            # Already dynamic, but the weights were rewritten above — TRT has to
+            # parse the lowered graph, not the original file.
             dyn_path = source_path + ".dyn.onnx"
             onnx.save(onnx_model, dyn_path)
             source_path = dyn_path
 
         logger_trt = trt.Logger(trt.Logger.WARNING)
         builder    = trt.Builder(logger_trt)
-        network    = builder.create_network(0)
+        if self.pascal_compat:
+            # TRT 8: create_network(0) selects implicit batch, which the ONNX
+            # parser rejects outright ("network must have explicit batch").
+            network = builder.create_network(
+                1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+            )
+        else:
+            # TRT 11: implicit batch no longer exists and EXPLICIT_BATCH was
+            # removed along with it. Networks are always explicit, always
+            # strongly typed.
+            network = builder.create_network(0)
         parser = trt.OnnxParser(network, logger_trt)
         with open(source_path, "rb") as f:
             if not parser.parse(f.read()):
@@ -377,6 +491,10 @@ class YoloEngine(InferenceEngine):
 
         config = builder.create_builder_config()
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 * 1024 ** 3)
+        if self.pascal_compat and self.precision == "fp16":
+            # Weak typing: the parsed graph is FP32 and this flag is what allows
+            # the builder to pick FP16 kernels. Removed in TRT 11.
+            config.set_flag(trt.BuilderFlag.FP16)
 
         profile = builder.create_optimization_profile()
         inp = network.get_input(0)
@@ -414,6 +532,15 @@ class YoloEngine(InferenceEngine):
         runtime = self._get_runtime()
         with open(path, "rb") as f:
             self._trt_engine = runtime.deserialize_cuda_engine(f.read())
+        if self._trt_engine is None:
+            # Almost always a TRT version mismatch. Without this, the next line
+            # raises AttributeError on None and the real cause is invisible.
+            raise RuntimeError(
+                f"TensorRT could not deserialize {os.path.basename(path)} "
+                f"(installed TensorRT: {trt.__version__}). This usually means the "
+                f"engine was built by a different TensorRT version. Delete the "
+                f".engine and .metadata files to force a rebuild."
+            )
         self._trt_ctx = self._trt_engine.create_execution_context()
 
         n = self._trt_engine.num_io_tensors

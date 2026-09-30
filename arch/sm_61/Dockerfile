@@ -70,9 +70,15 @@ RUN printf '%s\n' \
 # ── Inference engine ───────────────────────────────────────────────────────
 COPY inference_engine/ ./inference_engine/
 
+# PASCAL_COMPAT selects the TensorRT compilation model at runtime. It is an
+# image-level fact, not a user preference: it must match the TRT pinned in
+# requirements.txt (8.6.1). TRT 11 cannot be used here -- its floor is SM 7.5
+# and Pascal is SM 6.1, so this image is permanently on the TRT 8 path.
+#   1 = TRT 8 weak typing: EXPLICIT_BATCH network + BuilderFlag precision.
 ENV ZMQ_ENDPOINT=ipc:///run/zmq/detector.sock \
     MODEL_DIR=/models \
     DEVICE=cuda:0 \
-    YOLO_CONFIG_DIR=/tmp
+    YOLO_CONFIG_DIR=/tmp \
+    PASCAL_COMPAT=1
 
 CMD ["python3", "-m", "inference_engine"]

@@ -65,6 +65,7 @@ def main():
             precision      = config.precision,
             optimize       = config.optimize,
             max_batch_size = config.max_batch_size,
+            pascal_compat  = config.pascal_compat,
         )
         run_batch_worker(
             endpoint      = config.endpoint,
