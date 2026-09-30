@@ -109,6 +109,44 @@ This repo lives alongside your Frigate installation as a peer directory:
     └── run-optimize.sh
 ```
 
+## Hardware support
+
+Two images, split by GPU generation. The split is structural, not a packaging choice:
+TensorRT 11's floor is SM 7.5 and Pascal is SM 6.1, so no single TensorRT can serve both.
+
+| Generation | SM | Consumer cards | Image | Min driver | Precisions |
+|---|---|---|---|---|---|
+| Maxwell | 5.0–5.2 | GTX 750 Ti, 950, 960, 970, 980, 980 Ti, TITAN X | — | — | not supported |
+| **Pascal** | **6.1** | GT 1030, GTX 1050, 1050 Ti, 1060, 1070, 1070 Ti, 1080, 1080 Ti, TITAN X (Pascal), TITAN Xp | **`sm_61`** | **≥ 525** | fp32 |
+| Volta | 7.0 | TITAN V only — no GeForce part shipped on Volta | — | — | not supported |
+| **Turing** | **7.5** | GTX 1650, 1650 Super, 1660, 1660 Super, 1660 Ti, RTX 2060, 2060 Super, 2070, 2070 Super, 2080, 2080 Super, 2080 Ti, TITAN RTX | **`sm_75plus`** | **≥ 570** | fp32, fp16 |
+| **Ampere** | **8.6** | RTX 3050, 3060, 3060 Ti, 3070, 3070 Ti, 3080, 3080 Ti, 3090, 3090 Ti | **`sm_75plus`** | **≥ 570** | fp32, fp16, bf16 |
+| **Ada Lovelace** | **8.9** | RTX 4060, 4060 Ti, 4070, 4070 Super, 4070 Ti, 4070 Ti Super, 4080, 4080 Super, 4090 | **`sm_75plus`** | **≥ 570** | fp32, fp16, bf16 |
+| **Blackwell** | **12.0** | RTX 5060, 5060 Ti, 5070, 5070 Ti, 5080, 5090 | **`sm_75plus`** | **≥ 570** | fp32, fp16, bf16 |
+
+Both images are CUDA 12, but on different minor versions, which is where the two driver
+minimums come from:
+
+| | `sm_61` | `sm_75plus` |
+|---|---|---|
+| Base image | `nvidia/cuda:12.2.2` | `nvidia/cuda:12.8.1` |
+| TensorRT | 8.6.1 (pinned) | 11.3.0.99 cu12 (pinned) |
+| PyTorch | 2.5.1, built from source for sm_61 | 2.11.0+cu128 (stock wheels) |
+| Compilation model | Weak typing (`PASCAL_COMPAT=1`) | Strong typing (`PASCAL_COMPAT=0`) |
+| Build time | 1–3 h (compiles PyTorch) | ~12 min |
+
+**Not supported.** Maxwell and older are below the floor of the PyTorch wheels the `sm_61`
+image is built with (`TORCH_CUDA_ARCH_LIST=6.1`, no PTX, so there is no JIT fallback).
+Volta falls between the two images — the `sm_61` wheels cannot run on it and TensorRT 11
+excludes it — but NVIDIA never shipped a GeForce part on Volta, so no consumer card lands
+there. Datacenter parts (P100, V100, A100, and the Tesla/Quadro lines generally) are out of
+scope; this targets consumer GPUs.
+
+**Precision is enforced, not assumed.** Request a precision the card cannot execute and the
+engine downgrades it with a warning rather than building something mislabelled. Pascal has no
+Tensor Cores and runs FP16 at 1/64 rate, so `sm_61` is pinned to fp32. BF16 hardware starts at
+Ampere, so a 2060 cannot do it regardless of what `inference.yaml` says.
+
 ## Setup
 
 ### Prerequisites
@@ -156,10 +194,10 @@ Also add to your `frigate` service:
 
 ### 2. Build the image
 
-#### Turing and newer (RTX 2060, 3060, 3080, 4090, …)
+#### Turing and newer — `sm_75plus`
 
-Standard PyTorch wheels work fine on Turing+. See the Performance section below for
-measured results on an RTX 2060.
+For any card in the Turing, Ampere, Ada or Blackwell rows of the matrix above. Stock
+PyTorch wheels cover sm_75 through sm_120, so there is nothing to compile.
 
 ```bash
 arch/sm_75plus/build.sh
@@ -167,9 +205,10 @@ arch/sm_75plus/build.sh
 
 Set `INFERENCE_IMAGE=frigate-inference:sm_75plus` in `.env`.
 
-#### Pascal (GTX 1050 Ti, 1060, 1070, 1080 Ti — sm_6.1)
+#### Pascal — `sm_61`
 
-Official PyTorch wheels don't support Pascal. Build custom wheels first:
+For the Pascal row of the matrix above. Official PyTorch wheels ship no sm_61 code, so
+the wheels have to be built first:
 
 ```bash
 arch/sm_61/build.sh
@@ -181,7 +220,10 @@ Docker container with `TORCH_CUDA_ARCH_LIST=6.1`, and drops the resulting `.whl`
 The build takes 1-3 hours depending on your CPU. It is resumable — build caches are
 bind-mounted so an interrupted build picks up where it left off.
 
-Keep `precision: fp32` in `inference.yaml` for Pascal — Pascal does not have Tensor Cores.
+The resulting wheels are built with `TORCH_CUDA_ARCH_LIST=6.1` and no PTX, so they run on
+sm_61 and nothing else. `precision` is forced to fp32 on this image — Pascal has no Tensor
+Cores and executes FP16 at 1/64 rate — so leaving `fp16` in `inference.yaml` is harmless but
+logs a warning on startup.
 
 ### 3. Start
 

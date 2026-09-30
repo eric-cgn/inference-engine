@@ -52,10 +52,11 @@ class YoloEngine(InferenceEngine):
         instead of surfacing later as an opaque ONNX parse error inside a
         background compile thread.
 
-        It keys on the TRT version, not on the GPU: running the sm_61 image on a
-        Turing card is a legitimate fallback, and PASCAL_COMPAT=1 is still
-        correct there, because what the flag really selects is which TRT API
-        generation to drive.
+        It keys on the TRT version, not on the GPU, because what the flag
+        selects is which TensorRT API generation to drive -- and that is a
+        property of the image, not of the card in the slot. Whether the GPU can
+        execute the requested precision is a separate question, handled by
+        InferenceEngine._enforce_precision.
 
             PASCAL_COMPAT=1  needs TRT < 11  (BuilderFlag precision still exists)
             PASCAL_COMPAT=0  needs TRT >= 10 (create_network(0) == explicit batch)
