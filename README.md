@@ -208,10 +208,46 @@ variables.
 | `endpoint` | `ipc:///run/zmq/detector.sock` | ZMQ socket path — must match Frigate |
 | `model_dir` | `/models` | Directory scanned for model files |
 | `device` | `cuda:0` | CUDA device |
-| `precision` | `fp32` | `fp32` / `fp16` / `bf16` |
+| `precision` | `fp32` | `fp32` / `fp16` / `bf16` — see below |
 | `engine_type` | `yolo` | Inference backend (only `yolo` currently) |
 | `num_workers` | `1` | Parallel workers (for multi-GPU) |
 | `max_batch_size` | `16` | Maximum frames per GPU batch |
+
+### Precision and your GPU
+
+`precision` is validated against the card at startup and downgraded, with a warning,
+if the hardware cannot execute it. It is never silently mislabelled.
+
+| | fp32 | fp16 | bf16 |
+|---|---|---|---|
+| Pascal — GTX 10-series (sm 6.1) | ✅ | ✗ no Tensor Cores, runs at 1/64 rate | ✗ |
+| Turing — RTX 20-series (sm 7.5) | ✅ | ✅ Tensor Cores, ~2× | ✗ no BF16 hardware |
+| Ampere and newer (sm 8.0+) | ✅ | ✅ | ✅ |
+
+BF16 hardware starts at Ampere, so an RTX 2060 cannot run it. On the TRT 11 path
+there is also no route that produces a genuinely BF16 engine, so `bf16` builds fp16
+and says so rather than recording a precision the engine does not have.
+
+### `PASCAL_COMPAT`
+
+Not a user setting. It selects which TensorRT API generation the compile path drives,
+and is baked into each image by its Dockerfile because it has to match the TensorRT
+installed there:
+
+| Image | TensorRT | `PASCAL_COMPAT` | Compilation model |
+|---|---|---|---|
+| `sm_61` | 8.6.1 (pinned) | `1` | Weak typing — `EXPLICIT_BATCH` network, precision via `BuilderFlag` |
+| `sm_75plus` | 11.3.0.99 (pinned) | `0` | Strong typing — precision carried by the ONNX graph |
+
+The two APIs are mutually exclusive: TRT 11 removed the per-precision `BuilderFlag`s,
+and on TRT 8 the strongly-typed call selects *implicit* batch, which the ONNX parser
+rejects. Because TensorRT 11's floor is SM 7.5 and Pascal is SM 6.1, no single
+TensorRT can serve both cards — the split is structural, not a workaround.
+
+It is deliberately read only from the environment and not from `inference.yaml`. The
+engine verifies it against the installed TensorRT on startup and refuses to run on a
+mismatch, so a wrong value fails immediately by name rather than as an opaque ONNX
+parse error during a background compile.
 
 ## Frigate configuration
 
