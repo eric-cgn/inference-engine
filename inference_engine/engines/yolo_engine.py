@@ -438,10 +438,11 @@ class YoloEngine(InferenceEngine):
         import tensorrt as trt
         import copy
 
-        onnx_model = onnx.load(source_path)
-        inp_shape  = onnx_model.graph.input[0].type.tensor_type.shape
-        dim0       = inp_shape.dim[0]
-        is_dynamic = dim0.HasField("dim_param") or not dim0.HasField("dim_value")
+        original_path = source_path
+        onnx_model    = onnx.load(source_path)
+        inp_shape     = onnx_model.graph.input[0].type.tensor_type.shape
+        dim0          = inp_shape.dim[0]
+        is_dynamic    = dim0.HasField("dim_param") or not dim0.HasField("dim_value")
 
         # Read spatial dims from ONNX; fall back to 640 if dynamic or 0.
         def _static_dim(d):
@@ -449,6 +450,52 @@ class YoloEngine(InferenceEngine):
         h = _static_dim(inp_shape.dim[2]) or 640
         w = _static_dim(inp_shape.dim[3]) or 640
         logger.info(f"ONNX input spatial size: {h}×{w}")
+
+        def _prepare_source(lower_fp16: bool) -> str:
+            """Return the path to the graph TRT should parse."""
+            model = onnx.load(original_path)
+            if lower_fp16:
+                from onnxconverter_common import float16
+                logger.info("Lowering ONNX weights to FP16 for strongly-typed TRT build")
+                model = float16.convert_float_to_float16(model, keep_io_types=True)
+
+            if not is_dynamic:
+                logger.info("Static batch ONNX — patching to dynamic for TRT optimization profile")
+                model = copy.deepcopy(model)
+                for t in list(model.graph.input) + list(model.graph.output):
+                    # dim_value and dim_param are a protobuf oneof, so assigning
+                    # dim_param already clears dim_value. An explicit ClearField
+                    # here produces byte-identical output; don't re-add it.
+                    t.type.tensor_type.shape.dim[0].dim_param = "batch"
+            elif not lower_fp16:
+                # Already dynamic and unmodified — parse the file as it stands.
+                return original_path
+
+            dyn_path = original_path + ".dyn.onnx"
+            onnx.save(model, dyn_path)
+            return dyn_path
+
+        logger_trt = trt.Logger(trt.Logger.WARNING)
+        builder    = trt.Builder(logger_trt)
+
+        def _parse(path):
+            """Parse `path` into a fresh network. Returns (network, errors)."""
+            if self.pascal_compat:
+                # TRT 8: create_network(0) selects implicit batch, which the ONNX
+                # parser rejects outright ("network must have explicit batch").
+                net = builder.create_network(
+                    1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+                )
+            else:
+                # TRT 11: implicit batch no longer exists and EXPLICIT_BATCH was
+                # removed along with it. Networks are always explicit, always
+                # strongly typed.
+                net = builder.create_network(0)
+            parser = trt.OnnxParser(net, logger_trt)
+            with open(path, "rb") as f:
+                if parser.parse(f.read()):
+                    return net, None
+            return None, [str(parser.get_error(i)) for i in range(parser.num_errors)]
 
         # How precision reaches the engine depends on the TRT generation that
         # this image ships (see PASCAL_COMPAT in the Dockerfiles):
@@ -461,47 +508,33 @@ class YoloEngine(InferenceEngine):
         #       graph itself: lower the weights to FP16 and keep FP32 I/O so
         #       the preprocessing path in _run_trt is unaffected.
         lower_to_fp16 = (not self.pascal_compat) and self.precision == "fp16"
-        if lower_to_fp16:
-            from onnxconverter_common import float16
-            logger.info("Lowering ONNX weights to FP16 for strongly-typed TRT build")
-            onnx_model = float16.convert_float_to_float16(onnx_model, keep_io_types=True)
 
-        if not is_dynamic:
-            logger.info("Static batch ONNX — patching to dynamic for TRT optimization profile")
-            model_dyn = copy.deepcopy(onnx_model)
-            for t in list(model_dyn.graph.input) + list(model_dyn.graph.output):
-                # dim_value and dim_param are a protobuf oneof, so assigning
-                # dim_param already clears dim_value. An explicit ClearField
-                # here produces byte-identical output; don't re-add it.
-                t.type.tensor_type.shape.dim[0].dim_param = "batch"
-            dyn_path = source_path + ".dyn.onnx"
-            onnx.save(model_dyn, dyn_path)
-            source_path = dyn_path
-        elif lower_to_fp16:
-            # Already dynamic, but the weights were rewritten above — TRT has to
-            # parse the lowered graph, not the original file.
-            dyn_path = source_path + ".dyn.onnx"
-            onnx.save(onnx_model, dyn_path)
-            source_path = dyn_path
+        source_path      = _prepare_source(lower_to_fp16)
+        network, errors  = _parse(source_path)
 
-        logger_trt = trt.Logger(trt.Logger.WARNING)
-        builder    = trt.Builder(logger_trt)
-        if self.pascal_compat:
-            # TRT 8: create_network(0) selects implicit batch, which the ONNX
-            # parser rejects outright ("network must have explicit batch").
-            network = builder.create_network(
-                1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+        if network is None and lower_to_fp16:
+            # onnxconverter-common keeps some ops (Range, Resize, ...) in FP32,
+            # and where one of those feeds a Concat alongside converted
+            # siblings, TRT 11 rejects the mixed input types rather than
+            # inserting casts the way weak typing used to. It is graph-shaped,
+            # not a config error: yolo26n hits it via Range, other YOLO exports
+            # do not. Build FP32 rather than failing the compile outright.
+            logger.warning(
+                "FP16 graph was rejected by the TRT parser — falling back to fp32. "
+                "This model mixes FP16 and FP32 at a layer that strongly-typed "
+                "TensorRT will not implicitly cast. First error: %s",
+                (errors or ["?"])[0][:200],
             )
-        else:
-            # TRT 11: implicit batch no longer exists and EXPLICIT_BATCH was
-            # removed along with it. Networks are always explicit, always
-            # strongly typed.
-            network = builder.create_network(0)
-        parser = trt.OnnxParser(network, logger_trt)
-        with open(source_path, "rb") as f:
-            if not parser.parse(f.read()):
-                errors = [str(parser.get_error(i)) for i in range(parser.num_errors)]
-                raise RuntimeError(f"ONNX parse failed: {'; '.join(errors)}")
+            # Record what is actually built. Leaving self.precision as fp16
+            # would make _check_engine see a permanent fp32 -> fp16 mismatch and
+            # recompile on every single load.
+            self.precision  = "fp32"
+            lower_to_fp16   = False
+            source_path     = _prepare_source(False)
+            network, errors = _parse(source_path)
+
+        if network is None:
+            raise RuntimeError(f"ONNX parse failed: {'; '.join(errors or [])}")
 
         config = builder.create_builder_config()
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 * 1024 ** 3)
@@ -526,6 +559,7 @@ class YoloEngine(InferenceEngine):
         with open(tmp_path, "wb") as f:
             f.write(engine_bytes)
         os.rename(tmp_path, engine_path)   # atomic swap
+
 
     def _compile_engine_from_pt(self, source_path: str, engine_path: str):
         import ultralytics
