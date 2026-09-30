@@ -321,16 +321,30 @@ class YoloEngine(InferenceEngine):
         # A serialized engine can only be deserialized by the TRT version that
         # built it. Without this check a TRT upgrade yields "use", and the
         # deserialize then fails at load time with detection already offline.
+        #
+        # Only act on it when there is a source model to rebuild from. For an
+        # engine-only deployment a recompile is impossible, and returning
+        # "recompile" there would turn a working setup into a hard failure in
+        # load_model; warn and let _load_trt_direct report it if it really is
+        # incompatible.
         stored_trt  = meta.get("trt_version", "")
         current_trt = self._trt_version()
-        if not stored_trt:
-            return ("recompile",
-                    "engine predates TRT version tracking — rebuilding to "
-                    "guarantee it matches the installed TensorRT")
-        if current_trt and stored_trt != current_trt:
-            return ("recompile",
-                    f"TensorRT changed {stored_trt} → {current_trt} "
-                    f"(engines are not portable across TRT versions)")
+        can_rebuild = bool(source_path and os.path.exists(source_path))
+        if can_rebuild:
+            if not stored_trt:
+                return ("recompile",
+                        "engine predates TRT version tracking — rebuilding to "
+                        "guarantee it matches the installed TensorRT")
+            if current_trt and stored_trt != current_trt:
+                return ("recompile",
+                        f"TensorRT changed {stored_trt} → {current_trt} "
+                        f"(engines are not portable across TRT versions)")
+        elif stored_trt and current_trt and stored_trt != current_trt:
+            logger.warning(
+                f"Engine was built by TensorRT {stored_trt} but {current_trt} is "
+                f"installed, and no source model is available to rebuild from — "
+                f"loading it will probably fail."
+            )
 
         if source_path and os.path.exists(source_path):
             current = self._sha256(source_path)
