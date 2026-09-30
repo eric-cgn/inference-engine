@@ -1,6 +1,11 @@
 # Changelog
 
-## v1.2 (unreleased)
+## v1.2 (2026-09-30)
+
+> **Upgrading:** `sm_75plus` moves from TensorRT 10 to 11.3. Serialized engines are not
+> portable across TensorRT versions, so every existing `.engine` is invalidated and will
+> be recompiled on first use — detection is unavailable for a few minutes per model while
+> that runs. `sm_61` is unaffected.
 
 - **TensorRT 11 support** (#3, @felalex) — TRT 11 makes strongly-typed networks
   mandatory and removed the per-precision `BuilderFlag`s, so precision must now come
