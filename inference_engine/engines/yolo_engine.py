@@ -613,6 +613,8 @@ class YoloEngine(InferenceEngine):
         self._nms_in_model = (len(out_shape) == 3 and out_shape[2] == 6)
         logger.info(f"TRT output {out_shape} → {'post-NMS (skipping external NMS)' if self._nms_in_model else 'raw head (applying external NMS)'}")
 
+        self._ensure_gpu_staging()
+
         # Warm-up
         dummy = torch.zeros(1, 3, self._inp_h, self._inp_w, device="cuda")
         self._trt_forward(dummy)
@@ -643,9 +645,38 @@ class YoloEngine(InferenceEngine):
 
     # ── Direct TRT path ────────────────────────────────────────────────────
 
+    def _ensure_gpu_staging(self):
+        """Allocate the preprocessing stream and pinned staging buffer.
+
+        Lazy so that callers which set up _inp_h/_inp_w without going through
+        _load_trt_direct (the unit tests) still work.
+
+        The pinned buffer has one slot per batch position on purpose. A pinned
+        buffer makes the host->device copy asynchronous, but `copy_` into it is
+        a *host* operation and is not ordered against the stream, so a single
+        shared slot lets frame N+1 overwrite the staging bytes while frame N's
+        DMA is still in flight.
+        """
+        import torch
+        if getattr(self, "_stream", None) is None:
+            self._stream = torch.cuda.Stream()
+        want = (max(1, self.max_batch_size), self._inp_h, self._inp_w, 3)
+        pinned = getattr(self, "_inp_pinned", None)
+        if pinned is None or tuple(pinned.shape) != want:
+            self._inp_pinned = torch.empty(*want, dtype=torch.uint8).pin_memory()
+
     def _trt_forward(self, inp: "torch.Tensor") -> "torch.Tensor":
         """Execute the TRT engine on an (N,3,H,W) CUDA tensor."""
         import torch
+
+        # TensorRT reads the input through a raw data_ptr() and assumes a
+        # contiguous NCHW buffer. A permuted tensor (any HWC source) is a view
+        # with non-contiguous strides, so handing it over directly makes the
+        # engine read the wrong layout and silently return nothing. Batching
+        # used to hide this, because torch.cat materialises a contiguous copy;
+        # a single-frame batch passed straight through does not.
+        if not inp.is_contiguous():
+            inp = inp.contiguous()
 
         batch = inp.shape[0]
         self._trt_ctx.set_input_shape(self._trt_in, list(inp.shape))
@@ -655,8 +686,21 @@ class YoloEngine(InferenceEngine):
 
         self._trt_ctx.set_tensor_address(self._trt_in,  inp.data_ptr())
         self._trt_ctx.set_tensor_address(self._trt_out, out.data_ptr())
-        self._trt_ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-        torch.cuda.synchronize()
+
+        # Run on the dedicated preprocessing stream rather than the default one.
+        # Preprocessing was issued there, so the engine is already ordered behind
+        # it; wait_stream additionally covers work still pending on the default
+        # stream, such as the output allocation above. TensorRT 11 warns
+        # explicitly that enqueueV3 on the default stream forces extra
+        # cudaStreamSynchronize calls.
+        stream = getattr(self, "_stream", None)
+        if stream is None:
+            self._trt_ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+            torch.cuda.synchronize()
+        else:
+            stream.wait_stream(torch.cuda.default_stream())
+            self._trt_ctx.execute_async_v3(stream.cuda_stream)
+            stream.synchronize()
         return out
 
     def _run_trt(self, frames_np) -> np.ndarray:
@@ -671,26 +715,52 @@ class YoloEngine(InferenceEngine):
         batch  = len(frames)
 
         # ── Preprocess ────────────────────────────────────────────────────
-        tensors = []
-        for f in frames:
-            # Frigate may send CHW float32 (nchw input_tensor mode)
-            if (f.ndim == 3 and f.shape[0] in (1, 3)
-                    and f.shape[0] < f.shape[1] and f.shape[0] < f.shape[2]):
-                f = np.transpose(f, (1, 2, 0))
-                if f.dtype in (np.float32, np.float64):
-                    f = (f * 255).clip(0, 255).astype(np.uint8)
-            t = torch.as_tensor(f.copy(), device="cuda").float()
-            # Decide normalization from the wire dtype, not from pixel values.
-            # A near-black uint8 frame (max <= 1) reads as already-normalized to a
-            # value sniff, which silently skips the divide — a 255x brightness error.
-            if np.issubdtype(f.dtype, np.integer):
-                t.div_(255.0)                # uint8 0-255 (Frigate input_dtype: int)
-            elif t.max() > 1.5:              # float_denorm: float32 still in 0-255
-                t.div_(255.0)
-            t = t.permute(2, 0, 1).unsqueeze(0)   # (1, C, H, W)
-            tensors.append(t)
+        # Which wire format arrives is decided by Frigate's model.input_tensor
+        # and model.input_dtype, and they cost very different amounts:
+        #
+        #   float32 CHW  uploaded to the GPU as-is. For input_dtype: float the
+        #                pixels are already normalised, so the CPU never touches
+        #                them -- no transpose, no uint8 round trip.
+        #   uint8        staged through a pinned buffer so the host->device copy
+        #                is asynchronous, then scaled on the GPU.
+        #   float32 HWC  uploaded directly and permuted on the GPU. It must not
+        #                use the pinned buffer, which is uint8 and would truncate
+        #                0-1 values to zero -- a black frame.
+        #
+        # Normalization follows the wire dtype rather than pixel values: a
+        # near-black uint8 frame reads as already-normalised to a value sniff,
+        # which would skip the divide and hand the model a 255x over-bright
+        # image. The float paths keep a value check so Frigate's float_denorm
+        # mode, which sends float32 still in 0-255, is scaled correctly.
+        self._ensure_gpu_staging()
+        with torch.cuda.stream(self._stream):
+            tensors = []
+            for i, f in enumerate(frames):
+                is_chw = (f.ndim == 3 and f.shape[0] in (1, 3)
+                          and f.shape[0] < f.shape[1] and f.shape[0] < f.shape[2])
 
-        inp = torch.cat(tensors, dim=0)            # (N, C, H, W)
+                if np.issubdtype(f.dtype, np.integer):
+                    if is_chw:
+                        f = np.ascontiguousarray(np.transpose(f, (1, 2, 0)))
+                    slot = self._inp_pinned[i] if i < self._inp_pinned.shape[0] else None
+                    if slot is not None and f.shape == tuple(slot.shape):
+                        slot.copy_(torch.as_tensor(f))
+                        t = (slot.unsqueeze(0)
+                                 .to(device="cuda", non_blocking=True)
+                                 .float().div_(255.0).permute(0, 3, 1, 2))
+                    else:
+                        # Off-size frame (resized below) or batch overflow --
+                        # skip staging rather than mis-shape the copy.
+                        t = (torch.as_tensor(np.ascontiguousarray(f), device="cuda")
+                                  .float().div_(255.0).permute(2, 0, 1).unsqueeze(0))
+                else:
+                    t = torch.as_tensor(np.ascontiguousarray(f), device="cuda").float()
+                    t = t.unsqueeze(0) if is_chw else t.permute(2, 0, 1).unsqueeze(0)
+                    if t.max() > 1.5:        # float_denorm: float32 still in 0-255
+                        t.div_(255.0)
+                tensors.append(t)
+
+            inp = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
         if inp.shape[2] != self._inp_h or inp.shape[3] != self._inp_w:
             inp = F.interpolate(inp, (self._inp_h, self._inp_w),
                                 mode="bilinear", align_corners=False)
