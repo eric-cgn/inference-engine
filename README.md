@@ -279,20 +279,43 @@ variables.
 | `num_workers` | `1` | Parallel workers (for multi-GPU) |
 | `max_batch_size` | `16` | Maximum frames per GPU batch |
 
+### Two independent "data type" settings
+
+These are easy to confuse. They are unrelated and set in different places:
+
+| | where | what it controls |
+|---|---|---|
+| **`precision`** | `inference.yaml` (this project) | the numeric type the **engine computes in** — fp32 / fp16 / bf16 |
+| **`input_dtype`** | Frigate's `config.yml` | the type frames are **sent over the wire** as — `int` / `float` / `float_denorm` |
+
+`input_dtype: int` is not a reduced-precision mode. The model still computes in whatever
+`precision` says; `int` only means Frigate ships raw uint8 and the ÷255 happens on the GPU
+instead of Frigate's CPU. See [Wire format](#wire-format) — it is worth **+17% on an RTX
+2060 and +26% on a GTX 1050 Ti**, and applies to every card.
+
 ### Precision and your GPU
 
 `precision` is validated against the card at startup and downgraded, with a warning,
 if the hardware cannot execute it. It is never silently mislabelled.
 
-| | fp32 | fp16 | bf16 |
-|---|---|---|---|
-| Pascal — GTX 10-series (sm 6.1) | ✅ | ✗ no Tensor Cores, runs at 1/64 rate | ✗ |
-| Turing — RTX 20-series (sm 7.5) | ✅ | ✅ Tensor Cores, ~2× | ✗ no BF16 hardware |
-| Ampere and newer (sm 8.0+) | ✅ | ✅ | ✅ |
+| | fp32 | fp16 | bf16 | int8 |
+|---|---|---|---|---|
+| Pascal — GTX 10-series (sm 6.1) | ✅ | ✗ no Tensor Cores, runs at 1/64 rate | ✗ | ✗ not implemented |
+| Turing — RTX 20-series (sm 7.5) | ✅ | ✅ Tensor Cores, ~2× | ✗ no BF16 hardware | ✗ not implemented |
+| Ampere and newer (sm 8.0+) | ✅ | ✅ | ✅ | ✗ not implemented |
 
 BF16 hardware starts at Ampere, so an RTX 2060 cannot run it. On the TRT 11 path
 there is also no route that produces a genuinely BF16 engine, so `bf16` builds fp16
 and says so rather than recording a precision the engine does not have.
+
+**INT8 is not supported by this engine**, on any card — `precision` accepts only
+`fp32`, `fp16` and `bf16`, and anything else is rejected at startup. The hardware is
+capable: Turing and newer have INT8 Tensor Cores, and INT8 inference is typically
+~2× fp16. What is missing is the quantization step. TensorRT 11 removed the INT8
+builder flag in favour of explicit Q/DQ nodes, so using it means quantizing the ONNX
+model first — a calibration pass over representative frames, with accuracy validation,
+since INT8 can cost detection quality in a way fp16 does not. That is a feature, not a
+flag, and it is out of scope here.
 
 ### `PASCAL_COMPAT`
 
@@ -361,6 +384,7 @@ model:
 ```
 
 ### Wire format
+<a id="wire-format"></a>
 
 `input_tensor` and `input_dtype` decide what Frigate puts on the socket, and its
 defaults (`nchw` / `float`) are the slowest combination. Set both explicitly.
