@@ -11,7 +11,8 @@ def create_engine(engine_type: str, **kwargs) -> InferenceEngine:
     Args:
         engine_type: One of "yolo" (more to come).
         **kwargs:    Passed directly to the engine constructor:
-                     device, model_dir, max_dets, precision.
+                     device, model_dir, max_dets, precision, optimize,
+                     max_batch_size, pascal_compat.
     """
     if engine_type == "yolo":
         from .yolo_engine import YoloEngine
