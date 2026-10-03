@@ -62,6 +62,9 @@ class InputNormalizationTest(unittest.TestCase):
 
         class _CapturingEngine(YoloEngine):
             def _trt_forward(self, inp):
+                # Preprocessing runs on the engine stream; the real
+                # _trt_forward stays on it, but this clone runs on the default
+                # stream, so wait or it can read the tensor before it is written.
                 torch.cuda.current_stream().wait_stream(self._stream)
                 captured["inp"] = inp.detach().clone()
                 # 4 box channels + 2 classes over 10 anchors: enough shape for
