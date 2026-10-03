@@ -62,6 +62,7 @@ class InputNormalizationTest(unittest.TestCase):
 
         class _CapturingEngine(YoloEngine):
             def _trt_forward(self, inp):
+                torch.cuda.current_stream().wait_stream(self._stream)
                 captured["inp"] = inp.detach().clone()
                 # 4 box channels + 2 classes over 10 anchors: enough shape for
                 # the raw-head decode to run, and all-zero so it finds nothing.

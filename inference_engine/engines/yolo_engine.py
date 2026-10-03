@@ -741,10 +741,13 @@ class YoloEngine(InferenceEngine):
                         t.div_(255.0)
                 tensors.append(t)
 
-            inp = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
-        if inp.shape[2] != self._inp_h or inp.shape[3] != self._inp_w:
-            inp = F.interpolate(inp, (self._inp_h, self._inp_w),
-                                mode="bilinear", align_corners=False)
+            # Contiguous copy and resize must stay on self._stream: _trt_forward
+            # runs .contiguous() on the default stream, which does not wait for
+            # this one.
+            inp = tensors[0].contiguous() if len(tensors) == 1 else torch.cat(tensors, dim=0)
+            if inp.shape[2] != self._inp_h or inp.shape[3] != self._inp_w:
+                inp = F.interpolate(inp, (self._inp_h, self._inp_w),
+                                    mode="bilinear", align_corners=False)
 
         raw = self._trt_forward(inp)
 
