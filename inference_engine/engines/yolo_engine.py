@@ -41,6 +41,11 @@ class YoloEngine(InferenceEngine):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._validate_trt_profile()
+        # CUDA_GRAPHS=0 turns off graph replay in _trt_forward. Env-only, like
+        # PASCAL_COMPAT: it is an escape hatch, not a tuning knob.
+        from ..config import _env_bool
+        self._cuda_graphs = _env_bool("CUDA_GRAPHS", True)
+        self._graphs = {}
 
     def _validate_trt_profile(self):
         """
@@ -129,6 +134,7 @@ class YoloEngine(InferenceEngine):
     def load_model(self, path: str) -> bool:
         try:
             original_path = path
+            verified_files = None
             ext = os.path.splitext(path)[1]
             base = path[:-len(ext)] if ext in (".onnx", ".pt", ".engine") else path
             engine_path = base + ".engine"
@@ -152,9 +158,23 @@ class YoloEngine(InferenceEngine):
                 meta_path = base + ".metadata"
                 source    = self._resolve_source(path)
 
-                status, reason = self._check_engine(source, engine_path, meta_path)
+                # Frigate re-sends model_request after every ZMQ timeout, and
+                # _check_engine hashes the whole source and engine file (~0.4 s
+                # for a 225 MB ONNX) on the batch thread. That delays other
+                # detectors past their timeout, which sends more model_requests.
+                # Skip the hash while the files are unchanged since the last check.
+                files_key = (self._file_key(source), self._file_key(engine_path),
+                             self._file_key(meta_path))
+                if (self.model is not None and self.model_path == engine_path
+                        and files_key == getattr(self, "_verified_files", None)):
+                    status, reason = "verified", None
+                else:
+                    status, reason = self._check_engine(source, engine_path, meta_path)
 
-                if status == "use":
+                if status == "verified":
+                    logger.debug(f"Engine unchanged since last check: {os.path.basename(engine_path)}")
+
+                elif status == "use":
                     logger.info(f"Engine valid (metadata verified): {os.path.basename(engine_path)}")
 
                 elif status == "write_meta":
@@ -219,6 +239,9 @@ class YoloEngine(InferenceEngine):
                     return True
 
                 resolved = engine_path
+                # Taken after write_meta, so the new metadata file is included.
+                verified_files = (self._file_key(source), self._file_key(engine_path),
+                                  self._file_key(meta_path))
 
             else:
                 logger.warning(f"Unknown optimize='{self.optimize}', falling back to if_present")
@@ -228,6 +251,7 @@ class YoloEngine(InferenceEngine):
             if (self.model is not None and self.model_path == resolved
                     and self.model_mtime == mtime):
                 logger.debug(f"Model {os.path.basename(original_path)} already loaded (up to date).")
+                self._verified_files = verified_files
                 return True
 
             logger.info(f"Loading YOLO model: {resolved}  device={self.device}  precision={self.precision}")
@@ -240,6 +264,7 @@ class YoloEngine(InferenceEngine):
             self.model_name  = os.path.basename(original_path)
             self.model_path  = resolved
             self.model_mtime = mtime
+            self._verified_files = verified_files
             logger.info(f"Model {self.model_name} loaded.")
             return True
         except Exception as e:
@@ -280,6 +305,15 @@ class YoloEngine(InferenceEngine):
         except Exception as e:
             logger.error(f"ultralytics download failed for '{stem}': {e}")
             return None
+
+    @staticmethod
+    def _file_key(path):
+        """(size, mtime_ns) of a file, or None if it is missing. Cheap stand-in
+        for a hash when only "has this file changed" is needed."""
+        if not path or not os.path.exists(path):
+            return None
+        st = os.stat(path)
+        return (st.st_size, st.st_mtime_ns)
 
     @staticmethod
     def _sha256(path: str) -> str:
@@ -615,7 +649,11 @@ class YoloEngine(InferenceEngine):
 
         self._ensure_stream()
 
-        # Warm-up
+        # Graphs recorded against a previous engine point at its freed memory.
+        self._graphs = {}
+        self._use_graphs = getattr(self, "_cuda_graphs", False)
+
+        # Warm-up (also records the batch-1 CUDA graph)
         dummy = torch.zeros(1, 3, self._inp_h, self._inp_w, device="cuda")
         self._trt_forward(dummy)
         logger.info(f"TRT engine ready — input '{self._trt_in}' {list(shape)}")
@@ -668,6 +706,11 @@ class YoloEngine(InferenceEngine):
         if not inp.is_contiguous():
             inp = inp.contiguous()
 
+        if getattr(self, "_use_graphs", False) and getattr(self, "_stream", None) is not None:
+            out = self._trt_forward_graph(inp)
+            if out is not None:
+                return out
+
         batch = inp.shape[0]
         self._trt_ctx.set_input_shape(self._trt_in, list(inp.shape))
         out_shape = list(self._trt_ctx.get_tensor_shape(self._trt_out))
@@ -692,6 +735,76 @@ class YoloEngine(InferenceEngine):
             self._trt_ctx.execute_async_v3(stream.cuda_stream)
             stream.synchronize()
         return out
+
+    def _trt_forward_graph(self, inp: "torch.Tensor"):
+        """Replay a CUDA graph of the TensorRT call recorded for this batch size.
+
+        enqueueV3 launches every kernel of the engine from the CPU, one at a
+        time; for yolo26x that measured ~2.2 ms per frame on a Ryzen 5825U. A
+        graph launches the whole sequence in one call. A graph replays the exact
+        shapes and buffer addresses it was recorded with, so each batch size gets
+        its own graph and its own fixed input/output buffers.
+
+        The returned tensor is the graph's output buffer: it is overwritten by
+        the next call. _run_trt finishes with it before returning, and only one
+        inference runs at a time per engine.
+
+        Returns None when this batch size cannot be recorded; the caller then
+        falls back to a normal enqueue for it. Other batch sizes keep their
+        graphs.
+        """
+        import torch
+
+        batch = inp.shape[0]
+        if batch not in self._graphs:
+            try:
+                self._graphs[batch] = self._record_graph(inp)
+                logger.info(f"CUDA graph recorded for batch {batch}")
+            except Exception as e:
+                self._graphs[batch] = None
+                logger.warning(f"CUDA graph recording failed for batch {batch}; "
+                               f"using normal enqueue for it: {e}")
+                torch.cuda.synchronize()
+        entry = self._graphs[batch]
+        if entry is None:
+            return None
+
+        graph, static_in, static_out = entry
+        stream = self._stream
+        stream.wait_stream(torch.cuda.default_stream())
+        with torch.cuda.stream(stream):
+            static_in.copy_(inp)
+            graph.replay()
+        stream.synchronize()
+        return static_out
+
+    def _record_graph(self, inp: "torch.Tensor"):
+        import torch
+
+        static_in = inp.clone()
+        # Returns False (and only logs) for a shape outside the engine's
+        # profile, e.g. batch 2 on an engine built with max_batch_size 1.
+        if not self._trt_ctx.set_input_shape(self._trt_in, list(inp.shape)):
+            raise ValueError(f"engine does not accept input shape {list(inp.shape)}")
+        out_shape = list(self._trt_ctx.get_tensor_shape(self._trt_out))
+        out_shape[0] = inp.shape[0]
+        static_out = torch.empty(out_shape, dtype=torch.float32, device="cuda")
+        self._trt_ctx.set_tensor_address(self._trt_in,  static_in.data_ptr())
+        self._trt_ctx.set_tensor_address(self._trt_out, static_out.data_ptr())
+
+        stream = self._stream
+        stream.wait_stream(torch.cuda.default_stream())
+        # TensorRT does deferred setup on the first enqueue after a shape
+        # change, and that setup cannot be recorded. Run once normally first.
+        self._trt_ctx.execute_async_v3(stream.cuda_stream)
+        stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        # thread_local: inference runs on a worker thread; only CUDA calls made
+        # from this thread are checked against the capture.
+        with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            self._trt_ctx.execute_async_v3(stream.cuda_stream)
+        return graph, static_in, static_out
 
     def _run_trt(self, frames_np) -> np.ndarray:
         import torch
@@ -741,10 +854,15 @@ class YoloEngine(InferenceEngine):
                         t.div_(255.0)
                 tensors.append(t)
 
-            inp = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
-        if inp.shape[2] != self._inp_h or inp.shape[3] != self._inp_w:
-            inp = F.interpolate(inp, (self._inp_h, self._inp_w),
-                                mode="bilinear", align_corners=False)
+            # The contiguous copy and the resize must stay inside this block. A
+            # single uint8 frame is a permuted view; _trt_forward would make it
+            # contiguous on the default stream, which does not wait for this
+            # one, and TensorRT got a partly converted frame (raw scores off by
+            # up to 0.89 between two runs of the same frame).
+            inp = tensors[0].contiguous() if len(tensors) == 1 else torch.cat(tensors, dim=0)
+            if inp.shape[2] != self._inp_h or inp.shape[3] != self._inp_w:
+                inp = F.interpolate(inp, (self._inp_h, self._inp_w),
+                                    mode="bilinear", align_corners=False)
 
         raw = self._trt_forward(inp)
 
@@ -787,35 +905,37 @@ class YoloEngine(InferenceEngine):
         # Norfair's distance function and crash the camera processor process.
         area = (x2 - x1) * (y2 - y1)              # (N, 8400)
 
-        results = []
+        # One pass for the whole batch. mask.any() and boolean-mask indexing
+        # each make the CPU wait for the GPU, and the per-frame loop did that
+        # about six times per frame. nonzero() waits once per batch. Shifting
+        # each frame's boxes by 2x its index (boxes are clamped to 0-1) keeps
+        # NMS within a frame -- the same trick torchvision's batched_nms uses.
+        results = np.zeros((batch, self.max_dets, 6), np.float32)
+        img, anc = ((conf > CONF) & (area > 0)).nonzero(as_tuple=True)
+        if img.numel() == 0:
+            return results
+
+        bi = boxes[img, anc]          # (K, 4)
+        ci = conf[img, anc]           # (K,)
+        keep = tvops.nms(bi + img[:, None].to(bi.dtype) * 2.0, ci, IOU)  # score-descending
+
+        bk = bi[keep]
+        # Single CPU transfer for all kept detections; column 0 is the frame
+        # index, the rest is Frigate's (class, conf, y1, x1, y2, x2).
+        kept = torch.stack([
+            img[keep].float(),
+            cls_idx[img, anc][keep].float(),
+            ci[keep],
+            bk[:, 1],   # y1
+            bk[:, 0],   # x1
+            bk[:, 3],   # y2
+            bk[:, 2],   # x2
+        ], dim=1).cpu().numpy()
+
         for i in range(batch):
-            mask = (conf[i] > CONF) & (area[i] > 0)
-            if not mask.any():
-                results.append(np.zeros((self.max_dets, 6), np.float32))
-                continue
-
-            bi  = boxes[i][mask]      # (K, 4)
-            ci  = conf[i][mask]       # (K,)
-            cli = cls_idx[i][mask]    # (K,)
-
-            keep = tvops.nms(bi, ci, IOU)[:self.max_dets]
-            n    = len(keep)
-
-            # Single CPU transfer for all kept detections
-            kept = torch.stack([
-                cli[keep].float(),
-                ci[keep],
-                bi[keep, 1],   # y1 (Frigate: class, conf, y1, x1, y2, x2)
-                bi[keep, 0],   # x1
-                bi[keep, 3],   # y2
-                bi[keep, 2],   # x2
-            ], dim=1).cpu().numpy()
-
-            out = np.zeros((self.max_dets, 6), np.float32)
-            out[:n] = kept
-            results.append(out)
-
-        return np.array(results)
+            rows = kept[kept[:, 0] == i, 1:][:self.max_dets]
+            results[i, :len(rows)] = rows
+        return results
 
     # ── Ultralytics fallback ───────────────────────────────────────────────
 
