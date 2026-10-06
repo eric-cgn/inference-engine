@@ -650,17 +650,17 @@ matters this much.
 
 **RTX 2060** — `sm_75_121`, TensorRT 11.3.0.99, Frigate+ `yolov9s` 640 fp16, driver 580.159.03
 
-| Wire format | 1 client | 4 clients |
+| Wire format | 1 client: p50 / fps | 4 clients: p50 per client / **aggregate** fps |
 |---|---|---|
-| `int` + `nhwc` | **5.90 ms / 167 fps** | **21.4 ms / 186 fps** |
+| `int` + `nhwc` | **5.90 ms / 167 fps** | 21.4 ms / **186 fps** |
 | `float` + `nchw` | 8.34 ms / 119 fps | — |
 | `float` + `nhwc` | 8.40 ms / 118 fps | — |
 
 **GTX 1050 Ti** — `sm_61`, TensorRT 8.6.1, `yolo26n` 640 fp32
 
-| Wire format | 1 client | 4 clients |
+| Wire format | 1 client: p50 / fps | 4 clients: p50 per client / **aggregate** fps |
 |---|---|---|
-| `int` + `nhwc` | **10.1 ms / 98 fps** | **38.0 ms / 105 fps** |
+| `int` + `nhwc` | **10.1 ms / 98 fps** | 38.0 ms / **105 fps** |
 | `float` + `nchw` | 14.6 ms / 68 fps | — |
 | `float` + `nhwc` | 14.9 ms / 67 fps | — |
 
@@ -668,13 +668,26 @@ Both cards produce identical detections across all three formats; only the cost 
 CUDA graphs made no measurable difference to either of these models — see
 [`CUDA_GRAPHS`](#cuda_graphs), where it is a property of the model rather than the card.
 
-### In a live deployment
+### What the card can do, and what Frigate reports
 
-An RTX 2060 serving **14 cameras** at 5 fps detection, four `zmq` detector entries,
-`num_workers: 1`, `max_batch_size: 1`, Frigate+ `yolov9s` fp16: Frigate reports
-`inference_speed` around **24 ms** with essentially no skipped frames. The gap between that
-and the ~6 ms engine figure above is the ZMQ round trip plus queueing across the four
-detectors, not GPU time — which is the distinction the methodology note above is about.
+These are different numbers and they are easy to conflate.
+
+**Card throughput** is the aggregate figures above: **186 fps** on an RTX 2060 and
+**105 fps** on a GTX 1050 Ti, with four clients keeping the engine fed. That is the engine's
+capacity, and it is what to size a deployment against.
+
+**Frigate's `inference_speed` is a per-detector latency**, not a throughput. Each `zmq`
+entry is one request-at-a-time channel, so the figure is the round trip on *one* of N
+parallel channels sharing the same card. It cannot be turned into a throughput by
+inverting it: `1000 / inference_speed` gives one channel's ceiling, which is roughly
+1/N of what the card is actually delivering.
+
+A worked illustration: an RTX 2060 serving 14 cameras at 5 fps detection through four
+entries reports `inference_speed` near 24 ms per detector. Inverting that suggests ~42 fps
+and looks alarming against 70 fps of demand — but the four channels run concurrently, the
+card's measured capacity is 186 fps, and the deployment runs with no skipped frames at
+roughly a third of capacity. Use the aggregate figures for sizing and `inference_speed`
+only for "is a single channel's round trip acceptable".
 
 > **Note on batch size:** `max_batch_size > 1` does not help with Frigate. Frigate sends one
 > frame per ZMQ request and does not pipeline several frames into a message, so the batch
