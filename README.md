@@ -171,6 +171,25 @@ engine downgrades it with a warning rather than building something mislabelled. 
 Tensor Cores and runs FP16 at 1/64 rate, so `sm_61` is pinned to fp32. BF16 hardware starts at
 Ampere, so a 2060 cannot do it regardless of what `inference.yaml` says.
 
+### Tested on
+
+The table above is derived from NVIDIA's support matrices and the compiled architectures in
+each image. These are the cards it has actually been run on:
+
+| Card | Arch / SM | Image | TensorRT | Covered by |
+|---|---|---|---|---|
+| **GTX 1050 Ti** | Pascal 6.1 | `sm_61` | 8.6.1 | image build, engine compile, full test suite, determinism, all three wire formats, throughput |
+| **RTX 2060** | Turing 7.5 | `sm_75_121` | 11.3.0.99 | the same, plus continuous use with 14 cameras |
+| **RTX 3090 Ti** | Ampere 8.6 | `sm_75_121` | 11.3 | contributor-reported — fp16 compile and continuous use with 4 cameras ([#3](https://github.com/eric-cgn/inference-engine/pull/3), [#5](https://github.com/eric-cgn/inference-engine/pull/5), thanks @felalex) |
+
+Models exercised: Frigate+ `yolov9s` (640, fp16), `yolo26n` (640, fp32), and
+`yolo26x-obj365` (640, fp16) on the 3090 Ti.
+
+Everything else in the matrix is inference from the support matrices, not measurement. In
+particular nothing has been run on Ada or Blackwell. If you run this on a card that is not
+listed, a note either way is useful — especially a driver version, since Pascal's upper
+bound is real and the floor for `sm_75_121` has not been probed below 570.
+
 ## Setup
 
 ### Prerequisites
