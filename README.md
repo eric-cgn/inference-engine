@@ -26,15 +26,17 @@ is the ZMQ server on the other end of that socket.
 PyTorch 2.x wheels do not include native code for Pascal GPUs (GTX 1050 Ti, 1060, 1070,
 1080 Ti — compute capability sm_6.1). This project ships a build pipeline that compiles
 PyTorch 2.5.1 from source against CUDA 12.2 for sm_6.1, bringing YOLO26 and Frigate+
-models to hardware that would otherwise be left behind. Turing and newer (RTX 2060+)
+models to hardware that would otherwise be left behind. Turing through Blackwell (RTX 2060
+to RTX 50-series)
 work with standard wheels and need no special build.
 
 ## Models
 
 **YOLO26n (default)** — free, auto-downloads on first use (imports Ultralytics). The latest generation model
 with meaningfully better accuracy than YOLO11 at similar speed. With a TensorRT engine
-compiled for your GPU, yolo26n runs at ~80 FPS on a GTX 1050 Ti** — more than enough
-headroom for a significant number of cameras at 5 fps detection rates.
+compiled for your GPU it clears 100 fps on a GTX 1050 Ti — ample headroom for a good
+number of cameras at 5 fps detection rates. See [Performance](#performance) for the
+measured figures.
 
 **Frigate+ models** — if you have a Frigate+ subscription, point your Frigate config at
 your model and Frigate transfers it to the inference engine automatically over ZMQ on first
@@ -100,7 +102,7 @@ This repo lives alongside your Frigate installation as a peer directory:
 ├── .env.example
 ├── arch/
 │   ├── sm_61/                  ← Pascal build
-│   └── sm_75_121/              ← Turing+ build
+│   └── sm_75_121/              ← Turing–Blackwell build
 ├── config/
 │   └── inference.yaml          ← template
 ├── inference_engine/
@@ -147,8 +149,8 @@ Maxwell, Pascal and Volta; 590 and later drop them. Once your host moves past 58
 `sm_61` image stops working and the card is done, independently of anything in this repo.
 Every other row is open-ended.
 
-³ The image is named for the range it actually covers rather than `sm_75plus`, because
-"plus" is a promise CUDA 12 cannot keep. A cu12 toolkit can only target architectures that
+³ The image is named for the range it covers rather than with an open-ended "plus",
+because that is a promise CUDA 12 cannot keep. A cu12 toolkit can only target architectures that
 existed when it shipped, so Rubin and later need a separate cu13-based image — a new
 `arch/` tier, not a rebuild of this one. The `121` upper bound reflects that `sm_120`
 cubins run on `sm_121` by minor-version compatibility.
@@ -238,7 +240,7 @@ Also add to your `frigate` service:
 
 ### 2. Build the image
 
-#### Turing and newer — `sm_75_121`
+#### Turing through Blackwell — `sm_75_121`
 
 For any card in the Turing, Ampere, Ada or Blackwell rows of the matrix above. Stock
 PyTorch wheels cover sm_75 through sm_120, so there is nothing to compile.
@@ -437,14 +439,12 @@ happens on the GPU. With `float` it converts to float32 and divides on the CPU f
 putting 4.92 MB on the socket for the same pixels. Measured with Frigate out of the
 loop, four concurrent clients against one engine:
 
-| | `int` + `nhwc` | `float` + `nchw` | |
-|---|---|---|---|
-| RTX 2060 (TRT 11.3) | **23.0 ms** / 173 fps | 27.6 ms / 144 fps | +17% |
-| GTX 1050 Ti (TRT 8.6.1) | **38.4 ms** / 104 fps | 48.6 ms / 82 fps | +26% |
+`int` is worth roughly **+17% on an RTX 2060 and +26% on a GTX 1050 Ti** at four
+concurrent clients, and more at one client — around +25% and +42% — because per-frame
+transport is a larger share of the total when there is no queueing to hide it. The
+per-format figures are in [Performance](#performance).
 
-At a single client the gap is wider — +25% on the 2060, +42% on the 1050 — because the
-per-frame transport cost is a larger share of the total. All three wire formats produce
-identical detections; only the cost differs.
+All three wire formats produce identical detections; only the cost differs.
 
 **Frigate+ models ignore these settings.** Their metadata carries `inputShape` and
 `inputDataType`, and Frigate applies those after your config, so neither the `model:`
@@ -535,15 +535,16 @@ cycle_ms = gpu_inference_ms + frigate_overhead_ms
 ```
 
 `gpu_inference_ms` is the time the GPU spends on the forward pass. `frigate_overhead_ms`
-is fixed at roughly **20 ms** regardless of GPU speed — it is the cost of Frigate moving
+is fixed at roughly **18 ms** regardless of GPU speed — it is the cost of Frigate moving
 frames between its internal camera processor subprocesses, queuing them for the detector
 subprocess, and dispatching results back. You cannot reduce this by changing the inference
 engine; it is intrinsic to Frigate's architecture.
 
 **The practical consequence:** a fast GPU does not automatically increase throughput. A
-GPU that runs inference in 7 ms still has a ~27 ms cycle time. One ZMQ entry can only
-push ~37 fps regardless of how fast the GPU is. You need multiple ZMQ entries to keep the
-GPU continuously fed.
+GPU that runs inference in 6 ms still has a ~24 ms cycle time, so one ZMQ entry can push
+only ~42 fps however fast the GPU is. You need multiple entries to keep it fed. This is
+also why `input_dtype: int` is worth more than it looks — it cuts the transport half of
+that cycle, not the GPU half.
 
 ### Measuring your actual GPU time
 
@@ -583,18 +584,22 @@ N             = ceil( max_gpu_fps / entry_fps )
               = ceil( cycle_ms / gpu_inference_ms )
 ```
 
-**Worked example — RTX 2060, fp16:**
+**Worked example — RTX 2060, fp16, Frigate+ `yolov9s`:**
 
 ```
-GPU inference latency : 7.2 ms    (from stats)
-Frigate overhead      : ~20 ms    (fixed)
-Cycle time            : ~27 ms
+GPU inference latency : 5.9 ms    (measured, one client — see Performance)
+Frigate overhead      : ~18 ms    (round trip, fixed)
+Cycle time            : ~24 ms
 
-GPU max throughput    : 1000 / 7.2  ≈ 139 fps
-One entry capacity    : 1000 / 27   ≈  37 fps
+GPU max throughput    : 1000 / 5.9  ≈ 169 fps
+One entry capacity    : 1000 / 24   ≈  42 fps
 
-N = ceil(139 / 37) = ceil(3.75) = 4 entries to fully saturate the GPU
+N = ceil(169 / 42) = ceil(4.0) = 4 entries to fully saturate the GPU
 ```
+
+Run the arithmetic with your own two numbers rather than reusing these: a slower card or a
+larger model raises `gpu_inference_ms` and *lowers* the entry count you need, because each
+entry's cycle time is dominated by the fixed round trip either way.
 
 In practice, 3–4 entries covers most single-GPU setups. More than 4–5 is rarely
 beneficial and increases average latency, since frames begin queuing in the ROUTER socket
@@ -625,40 +630,57 @@ begin queuing in the ROUTER socket rather than being dispatched to the GPU immed
 
 ## Performance
 
-### RTX 2060 — sm_75_121 container
+All figures below were measured with the harness in `tools/`, driving the engine directly
+over ZMQ with the Frigate stack stopped. Two things make casual measurement misleading
+here, so they are worth stating:
 
-| | |
-|---|---|
-| **GPU** | NVIDIA GeForce RTX 2060 |
-| **Driver** | 580.159.03 |
-| **Container** | `frigate-inference:sm_75_121` |
-| **Model** | Frigate+ 2020.0 yolo9s base, compiled to FP16 TRT engine |
-| **Input** | 640×640 |
-| **ZMQ detector entries** | 3 (`zmq0`, `zmq1`, `zmq2`) |
-| **num_workers** | 1 |
-| **max_batch** | 1 (see note below) |
-| **precision** | fp16 |
-| **Cameras** | 11 cameras |
+- **Frigate's own `inference_speed` cannot isolate the engine.** Several `zmq` detectors
+  share one engine socket with `num_workers: 1`, so each request queues behind the others
+  and the number reflects queueing depth as much as engine cost. It is the right number for
+  "is my NVR keeping up", and the wrong one for comparing builds.
+- **Stopping containers may not stop Frigate.** If it runs under a supervisor — a systemd
+  unit wrapping `docker-compose up`, a restart policy, a watchdog — then `docker compose
+  stop` can trigger a restart and the benchmark silently runs against a contended GPU.
 
-**Sustained throughput (11 cameras, ~5 fps detect per camera):**
+### Engine throughput
 
-| Metric | Value |
-|--------|-------|
-| Throughput | ~84 fps |
-| Avg GPU inference latency | 7.2 ms |
-| Min / Max latency | 5.4 ms / 13.3 ms |
-| Idle (waiting for frames) | ~40% |
-| CPU usage | ~68% of one core |
+p50 latency and throughput for one client (clean latency) and four concurrent clients
+(production-like), by wire format. See [Wire format](#wire-format) for why the format
+matters this much.
 
-> **Note on batch size:** `max_batch > 1` is not currently effective with Frigate+ models.
-> Frigate sends one frame per ZMQ request and does not pipeline multiple frames into a
-> single message, so the batch worker always receives a batch of 1. Dynamic batching
-> would require Frigate to submit frames faster than the GPU can drain them, which does
-> not happen in normal single-GPU operation.
+**RTX 2060** — `sm_75_121`, TensorRT 11.3.0.99, Frigate+ `yolov9s` 640 fp16, driver 580.159.03
 
-The ~20 ms Frigate pipeline overhead is on top of the 7.2 ms GPU time — Frigate's own
-`inference_speed` stat will read closer to 27–30 ms. See the Tuning section for the full
-worked example calculating that 3 ZMQ detector entries are the right number for this setup.
+| Wire format | 1 client | 4 clients |
+|---|---|---|
+| `int` + `nhwc` | **5.90 ms / 167 fps** | **21.4 ms / 186 fps** |
+| `float` + `nchw` | 8.34 ms / 119 fps | — |
+| `float` + `nhwc` | 8.40 ms / 118 fps | — |
+
+**GTX 1050 Ti** — `sm_61`, TensorRT 8.6.1, `yolo26n` 640 fp32
+
+| Wire format | 1 client | 4 clients |
+|---|---|---|
+| `int` + `nhwc` | **10.1 ms / 98 fps** | **38.0 ms / 105 fps** |
+| `float` + `nchw` | 14.6 ms / 68 fps | — |
+| `float` + `nhwc` | 14.9 ms / 67 fps | — |
+
+Both cards produce identical detections across all three formats; only the cost differs.
+CUDA graphs made no measurable difference to either of these models — see
+[`CUDA_GRAPHS`](#cuda_graphs), where it is a property of the model rather than the card.
+
+### In a live deployment
+
+An RTX 2060 serving **14 cameras** at 5 fps detection, four `zmq` detector entries,
+`num_workers: 1`, `max_batch_size: 1`, Frigate+ `yolov9s` fp16: Frigate reports
+`inference_speed` around **24 ms** with essentially no skipped frames. The gap between that
+and the ~6 ms engine figure above is the ZMQ round trip plus queueing across the four
+detectors, not GPU time — which is the distinction the methodology note above is about.
+
+> **Note on batch size:** `max_batch_size > 1` does not help with Frigate. Frigate sends one
+> frame per ZMQ request and does not pipeline several frames into a message, so the batch
+> worker receives a batch of 1 regardless. Dynamic batching would need Frigate to submit
+> frames faster than the GPU drains them, which does not happen in normal single-GPU
+> operation. `max_batch_size: 1` is the right default.
 
 ## A Note on the License
 
