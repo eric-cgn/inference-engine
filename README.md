@@ -176,14 +176,15 @@ Ampere, so a 2060 cannot do it regardless of what `inference.yaml` says.
 The table above is derived from NVIDIA's support matrices and the compiled architectures in
 each image. These are the cards it has actually been run on:
 
-| Card | Arch / SM | Image | TensorRT | Covered by |
-|---|---|---|---|---|
-| **GTX 1050 Ti** | Pascal 6.1 | `sm_61` | 8.6.1 | image build, engine compile, full test suite, determinism, all three wire formats, throughput |
-| **RTX 2060** | Turing 7.5 | `sm_75_121` | 11.3.0.99 | the same, plus continuous use with 14 cameras |
-| **RTX 3090 Ti** | Ampere 8.6 | `sm_75_121` | 11.3 | contributor-reported — fp16 compile and continuous use with 4 cameras ([#3](https://github.com/eric-cgn/inference-engine/pull/3), [#5](https://github.com/eric-cgn/inference-engine/pull/5), thanks @felalex) |
+| Card | Arch / SM | Image | TensorRT | Model used | Covered by |
+|---|---|---|---|---|---|
+| **GTX 1050 Ti** | Pascal 6.1 | `sm_61` | 8.6.1 | `yolo26n` 640 fp32 | image build, engine compile, full test suite, determinism, all three wire formats, throughput |
+| **RTX 2060** | Turing 7.5 | `sm_75_121` | 11.3.0.99 | Frigate+ `yolov9s` 640 fp16 | the same, plus continuous use with 14 cameras |
+| **RTX 3090 Ti** | Ampere 8.6 | `sm_75_121` | 11.3 | `yolo26x-obj365` 640 fp16 | contributor-reported — fp16 compile and continuous use with 4 cameras ([#3](https://github.com/eric-cgn/inference-engine/pull/3), [#5](https://github.com/eric-cgn/inference-engine/pull/5), thanks @felalex) |
 
-Models exercised: Frigate+ `yolov9s` (640, fp16), `yolo26n` (640, fp32), and
-`yolo26x-obj365` (640, fp16) on the 3090 Ti.
+The model matters as much as the card for anything throughput-related, so it is listed per
+row rather than separately — a result measured with a small model does not transfer to a
+large one, or the reverse.
 
 Everything else in the matrix is inference from the support matrices, not measurement. In
 particular nothing has been run on Ada or Blackwell. If you run this on a card that is not
@@ -296,7 +297,8 @@ variables.
 | `precision` | `fp32` | `fp32` / `fp16` / `bf16` — see below |
 | `engine_type` | `yolo` | Inference backend (only `yolo` currently) |
 | `num_workers` | `1` | Parallel workers (for multi-GPU) |
-| `max_batch_size` | `16` | Maximum frames per GPU batch |
+| `max_batch_size` | `1` | Maximum frames per GPU batch |
+| `optimize` | `always` | `always` / `if_present` / `never` — engine compilation mode |
 
 ### Two independent "data type" settings
 
@@ -356,6 +358,28 @@ It is deliberately read only from the environment and not from `inference.yaml`.
 engine verifies it against the installed TensorRT on startup and refuses to run on a
 mismatch, so a wrong value fails immediately by name rather than as an opaque ONNX
 parse error during a background compile.
+
+### `CUDA_GRAPHS`
+
+Env-only, on by default. `CUDA_GRAPHS=0` turns it off.
+
+`enqueueV3` launches every kernel in the engine from the CPU, one at a time. With graphs on,
+that sequence is recorded once per batch size and replayed with a single call, so the
+per-kernel launch cost disappears. A batch size the engine cannot accept falls back to a
+normal enqueue for that size only, and graphs are discarded when an engine is reloaded.
+
+**How much it helps depends on the model, not the card.** Launch overhead scales with the
+number of kernels, so a big model has more of it to remove:
+
+| Model | Card | Effect |
+|---|---|---|
+| `yolo26x-obj365` 640 fp16 | RTX 3090 Ti | ~7.2 ms → 5.8 ms engine latency (contributor-reported) |
+| Frigate+ `yolov9s` 640 fp16 | RTX 2060 | no measurable change — the difference flipped sign between runs |
+| `yolo26n` 640 fp32 | GTX 1050 Ti | no measurable change — 105.1 fps either way |
+
+Graphs are recorded successfully on both TRT 11.3 and TRT 8.6.1, so the small-model result
+is a real measurement rather than a silent fallback. Nothing has shown graphs to be *slower*,
+so they are left on: a large model gains, a small one is unaffected.
 
 ## Frigate configuration
 
