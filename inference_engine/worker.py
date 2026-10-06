@@ -23,6 +23,7 @@ def run_worker(idx, cfg, shared_name, worker_socket):
         precision      = cfg.precision,
         optimize       = cfg.optimize,
         max_batch_size = cfg.max_batch_size,
+        pascal_compat  = cfg.pascal_compat,
     )
     run_batch_worker(
         endpoint          = f"ipc://{worker_socket}",

@@ -38,6 +38,90 @@ class YoloEngine(InferenceEngine):
     # ── Shared TRT runtime (one per process) ──────────────────────────────
     _trt_runtime = None
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._validate_trt_profile()
+        # CUDA_GRAPHS=0 turns off graph replay in _trt_forward. Env-only, like
+        # PASCAL_COMPAT: it is an escape hatch, not a tuning knob.
+        from ..config import _env_bool
+        self._cuda_graphs = _env_bool("CUDA_GRAPHS", True)
+        self._graphs = {}
+
+    def _validate_trt_profile(self):
+        """
+        Verify PASCAL_COMPAT agrees with the TensorRT that is actually installed.
+
+        PASCAL_COMPAT is declared per-image in the Dockerfile rather than sniffed
+        at runtime, so the active compilation model is explicit and greppable.
+        This check exists so that a mismatch fails immediately and legibly,
+        instead of surfacing later as an opaque ONNX parse error inside a
+        background compile thread.
+
+        It keys on the TRT version, not on the GPU, because what the flag
+        selects is which TensorRT API generation to drive -- and that is a
+        property of the image, not of the card in the slot. Whether the GPU can
+        execute the requested precision is a separate question, handled by
+        InferenceEngine._enforce_precision.
+
+            PASCAL_COMPAT=1  needs TRT < 11  (BuilderFlag precision still exists)
+            PASCAL_COMPAT=0  needs TRT >= 10 (create_network(0) == explicit batch)
+
+        TRT 10 satisfies both and is accepted either way.
+        """
+        try:
+            import tensorrt as trt
+        except ImportError:
+            return   # Ultralytics-only fallback; no TRT path to validate
+
+        try:
+            major = int(trt.__version__.split(".")[0])
+        except (ValueError, AttributeError):
+            logger.warning(
+                "Could not parse the installed TensorRT version — "
+                "skipping PASCAL_COMPAT validation"
+            )
+            return
+
+        if self.pascal_compat and major >= 11:
+            raise RuntimeError(
+                f"PASCAL_COMPAT=1 but TensorRT {trt.__version__} is installed. "
+                f"TRT 11 removed the per-precision BuilderFlags that this path "
+                f"depends on. Set PASCAL_COMPAT=0 in the Dockerfile for this image."
+            )
+        if not self.pascal_compat and major < 10:
+            raise RuntimeError(
+                f"PASCAL_COMPAT=0 but TensorRT {trt.__version__} is installed. "
+                f"On TRT 8, create_network(0) selects implicit batch, which the "
+                f"ONNX parser rejects. Set PASCAL_COMPAT=1 in the Dockerfile for "
+                f"this image."
+            )
+
+        if self.precision == "bf16" and not self.pascal_compat:
+            # onnxconverter-common lowers only to IEEE half, and TRT 11 has no
+            # BF16 builder flag, so no path here produces a genuinely BF16
+            # engine. Record what is actually built rather than labelling an
+            # FP16 engine "bf16" -- _check_engine compares that string, so a
+            # wrong label would silently never trigger a rebuild.
+            logger.warning(
+                "precision='bf16' has no supported TRT compile path — building fp16 instead"
+            )
+            self.precision = "fp16"
+
+        logger.info(
+            f"TRT profile: PASCAL_COMPAT={int(self.pascal_compat)} "
+            f"(tensorrt {trt.__version__}, "
+            f"{'weak typing / BuilderFlag' if self.pascal_compat else 'strongly typed / ONNX-lowered'})"
+        )
+
+    @staticmethod
+    def _trt_version() -> str:
+        """Installed TensorRT version, or '' when TRT is unavailable."""
+        try:
+            import tensorrt as trt
+            return str(trt.__version__)
+        except Exception:
+            return ""
+
     @classmethod
     def _get_runtime(cls):
         if cls._trt_runtime is None:
@@ -50,6 +134,7 @@ class YoloEngine(InferenceEngine):
     def load_model(self, path: str) -> bool:
         try:
             original_path = path
+            verified_files = None
             ext = os.path.splitext(path)[1]
             base = path[:-len(ext)] if ext in (".onnx", ".pt", ".engine") else path
             engine_path = base + ".engine"
@@ -73,9 +158,23 @@ class YoloEngine(InferenceEngine):
                 meta_path = base + ".metadata"
                 source    = self._resolve_source(path)
 
-                status, reason = self._check_engine(source, engine_path, meta_path)
+                # Frigate re-sends model_request after every ZMQ timeout, and
+                # _check_engine hashes the whole source and engine file (~0.4 s
+                # for a 225 MB ONNX) on the batch thread. That delays other
+                # detectors past their timeout, which sends more model_requests.
+                # Skip the hash while the files are unchanged since the last check.
+                files_key = (self._file_key(source), self._file_key(engine_path),
+                             self._file_key(meta_path))
+                if (self.model is not None and self.model_path == engine_path
+                        and files_key == getattr(self, "_verified_files", None)):
+                    status, reason = "verified", None
+                else:
+                    status, reason = self._check_engine(source, engine_path, meta_path)
 
-                if status == "use":
+                if status == "verified":
+                    logger.debug(f"Engine unchanged since last check: {os.path.basename(engine_path)}")
+
+                elif status == "use":
                     logger.info(f"Engine valid (metadata verified): {os.path.basename(engine_path)}")
 
                 elif status == "write_meta":
@@ -140,6 +239,9 @@ class YoloEngine(InferenceEngine):
                     return True
 
                 resolved = engine_path
+                # Taken after write_meta, so the new metadata file is included.
+                verified_files = (self._file_key(source), self._file_key(engine_path),
+                                  self._file_key(meta_path))
 
             else:
                 logger.warning(f"Unknown optimize='{self.optimize}', falling back to if_present")
@@ -149,6 +251,7 @@ class YoloEngine(InferenceEngine):
             if (self.model is not None and self.model_path == resolved
                     and self.model_mtime == mtime):
                 logger.debug(f"Model {os.path.basename(original_path)} already loaded (up to date).")
+                self._verified_files = verified_files
                 return True
 
             logger.info(f"Loading YOLO model: {resolved}  device={self.device}  precision={self.precision}")
@@ -161,6 +264,7 @@ class YoloEngine(InferenceEngine):
             self.model_name  = os.path.basename(original_path)
             self.model_path  = resolved
             self.model_mtime = mtime
+            self._verified_files = verified_files
             logger.info(f"Model {self.model_name} loaded.")
             return True
         except Exception as e:
@@ -203,6 +307,15 @@ class YoloEngine(InferenceEngine):
             return None
 
     @staticmethod
+    def _file_key(path):
+        """(size, mtime_ns) of a file, or None if it is missing. Cheap stand-in
+        for a hash when only "has this file changed" is needed."""
+        if not path or not os.path.exists(path):
+            return None
+        st = os.stat(path)
+        return (st.st_size, st.st_mtime_ns)
+
+    @staticmethod
     def _sha256(path: str) -> str:
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -240,6 +353,34 @@ class YoloEngine(InferenceEngine):
             return ("recompile",
                     f"precision changed {meta.get('precision')} → {self.precision}")
 
+        # A serialized engine can only be deserialized by the TRT version that
+        # built it. Without this check a TRT upgrade yields "use", and the
+        # deserialize then fails at load time with detection already offline.
+        #
+        # Only act on it when there is a source model to rebuild from. For an
+        # engine-only deployment a recompile is impossible, and returning
+        # "recompile" there would turn a working setup into a hard failure in
+        # load_model; warn and let _load_trt_direct report it if it really is
+        # incompatible.
+        stored_trt  = meta.get("trt_version", "")
+        current_trt = self._trt_version()
+        can_rebuild = bool(source_path and os.path.exists(source_path))
+        if can_rebuild:
+            if not stored_trt:
+                return ("recompile",
+                        "engine predates TRT version tracking — rebuilding to "
+                        "guarantee it matches the installed TensorRT")
+            if current_trt and stored_trt != current_trt:
+                return ("recompile",
+                        f"TensorRT changed {stored_trt} → {current_trt} "
+                        f"(engines are not portable across TRT versions)")
+        elif stored_trt and current_trt and stored_trt != current_trt:
+            logger.warning(
+                f"Engine was built by TensorRT {stored_trt} but {current_trt} is "
+                f"installed, and no source model is available to rebuild from — "
+                f"loading it will probably fail."
+            )
+
         if source_path and os.path.exists(source_path):
             current = self._sha256(source_path)
             stored  = meta.get("model_hash", "")
@@ -262,6 +403,9 @@ class YoloEngine(InferenceEngine):
             "engine_batch": self.max_batch_size,
             "precision":    self.precision,
             "engine_type":  "yolo",
+            # Serialized engines are not portable across TRT versions; record
+            # which one built this so _check_engine can force a rebuild.
+            "trt_version":  self._trt_version(),
         }
         tmp = meta_path + ".tmp"
         with open(tmp, "w") as f:
@@ -329,10 +473,11 @@ class YoloEngine(InferenceEngine):
         import tensorrt as trt
         import copy
 
-        onnx_model = onnx.load(source_path)
-        inp_shape  = onnx_model.graph.input[0].type.tensor_type.shape
-        dim0       = inp_shape.dim[0]
-        is_dynamic = dim0.HasField("dim_param") or not dim0.HasField("dim_value")
+        original_path = source_path
+        onnx_model    = onnx.load(source_path)
+        inp_shape     = onnx_model.graph.input[0].type.tensor_type.shape
+        dim0          = inp_shape.dim[0]
+        is_dynamic    = dim0.HasField("dim_param") or not dim0.HasField("dim_value")
 
         # Read spatial dims from ONNX; fall back to 640 if dynamic or 0.
         def _static_dim(d):
@@ -341,29 +486,96 @@ class YoloEngine(InferenceEngine):
         w = _static_dim(inp_shape.dim[3]) or 640
         logger.info(f"ONNX input spatial size: {h}×{w}")
 
-        if not is_dynamic:
-            logger.info("Static batch ONNX — patching to dynamic for TRT optimization profile")
-            model_dyn = copy.deepcopy(onnx_model)
-            for t in list(model_dyn.graph.input) + list(model_dyn.graph.output):
-                t.type.tensor_type.shape.dim[0].dim_param = "batch"
-            dyn_path = source_path + ".dyn.onnx"
-            onnx.save(model_dyn, dyn_path)
-            source_path = dyn_path
+        def _prepare_source(lower_fp16: bool) -> str:
+            """Return the path to the graph TRT should parse."""
+            model = onnx.load(original_path)
+            if lower_fp16:
+                from onnxconverter_common import float16
+                logger.info("Lowering ONNX weights to FP16 for strongly-typed TRT build")
+                model = float16.convert_float_to_float16(model, keep_io_types=True)
+
+            if not is_dynamic:
+                logger.info("Static batch ONNX — patching to dynamic for TRT optimization profile")
+                model = copy.deepcopy(model)
+                for t in list(model.graph.input) + list(model.graph.output):
+                    # dim_value and dim_param are a protobuf oneof, so assigning
+                    # dim_param already clears dim_value. An explicit ClearField
+                    # here produces byte-identical output; don't re-add it.
+                    t.type.tensor_type.shape.dim[0].dim_param = "batch"
+            elif not lower_fp16:
+                # Already dynamic and unmodified — parse the file as it stands.
+                return original_path
+
+            dyn_path = original_path + ".dyn.onnx"
+            onnx.save(model, dyn_path)
+            return dyn_path
 
         logger_trt = trt.Logger(trt.Logger.WARNING)
         builder    = trt.Builder(logger_trt)
-        network    = builder.create_network(
-            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        )
-        parser = trt.OnnxParser(network, logger_trt)
-        with open(source_path, "rb") as f:
-            if not parser.parse(f.read()):
-                errors = [str(parser.get_error(i)) for i in range(parser.num_errors)]
-                raise RuntimeError(f"ONNX parse failed: {'; '.join(errors)}")
+
+        def _parse(path):
+            """Parse `path` into a fresh network. Returns (network, errors)."""
+            if self.pascal_compat:
+                # TRT 8: create_network(0) selects implicit batch, which the ONNX
+                # parser rejects outright ("network must have explicit batch").
+                net = builder.create_network(
+                    1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+                )
+            else:
+                # TRT 11: implicit batch no longer exists and EXPLICIT_BATCH was
+                # removed along with it. Networks are always explicit, always
+                # strongly typed.
+                net = builder.create_network(0)
+            parser = trt.OnnxParser(net, logger_trt)
+            with open(path, "rb") as f:
+                if parser.parse(f.read()):
+                    return net, None
+            return None, [str(parser.get_error(i)) for i in range(parser.num_errors)]
+
+        # How precision reaches the engine depends on the TRT generation that
+        # this image ships (see PASCAL_COMPAT in the Dockerfiles):
+        #
+        #   PASCAL_COMPAT=1 (TRT 8)  weak typing. The graph stays FP32 and a
+        #       BuilderFlag *permits* the builder to select FP16 kernels. Set
+        #       further down, next to the builder config.
+        #   PASCAL_COMPAT=0 (TRT 11) strong typing. The per-precision
+        #       BuilderFlags were removed, so precision has to come from the
+        #       graph itself: lower the weights to FP16 and keep FP32 I/O so
+        #       the preprocessing path in _run_trt is unaffected.
+        lower_to_fp16 = (not self.pascal_compat) and self.precision == "fp16"
+
+        source_path      = _prepare_source(lower_to_fp16)
+        network, errors  = _parse(source_path)
+
+        if network is None and lower_to_fp16:
+            # onnxconverter-common keeps some ops (Range, Resize, ...) in FP32,
+            # and where one of those feeds a Concat alongside converted
+            # siblings, TRT 11 rejects the mixed input types rather than
+            # inserting casts the way weak typing used to. It is graph-shaped,
+            # not a config error: yolo26n hits it via Range, other YOLO exports
+            # do not. Build FP32 rather than failing the compile outright.
+            logger.warning(
+                "FP16 graph was rejected by the TRT parser — falling back to fp32. "
+                "This model mixes FP16 and FP32 at a layer that strongly-typed "
+                "TensorRT will not implicitly cast. First error: %s",
+                (errors or ["?"])[0][:200],
+            )
+            # Record what is actually built. Leaving self.precision as fp16
+            # would make _check_engine see a permanent fp32 -> fp16 mismatch and
+            # recompile on every single load.
+            self.precision  = "fp32"
+            lower_to_fp16   = False
+            source_path     = _prepare_source(False)
+            network, errors = _parse(source_path)
+
+        if network is None:
+            raise RuntimeError(f"ONNX parse failed: {'; '.join(errors or [])}")
 
         config = builder.create_builder_config()
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 * 1024 ** 3)
-        if self.precision == "fp16":
+        if self.pascal_compat and self.precision == "fp16":
+            # Weak typing: the parsed graph is FP32 and this flag is what allows
+            # the builder to pick FP16 kernels. Removed in TRT 11.
             config.set_flag(trt.BuilderFlag.FP16)
 
         profile = builder.create_optimization_profile()
@@ -382,6 +594,7 @@ class YoloEngine(InferenceEngine):
         with open(tmp_path, "wb") as f:
             f.write(engine_bytes)
         os.rename(tmp_path, engine_path)   # atomic swap
+
 
     def _compile_engine_from_pt(self, source_path: str, engine_path: str):
         import ultralytics
@@ -402,6 +615,15 @@ class YoloEngine(InferenceEngine):
         runtime = self._get_runtime()
         with open(path, "rb") as f:
             self._trt_engine = runtime.deserialize_cuda_engine(f.read())
+        if self._trt_engine is None:
+            # Almost always a TRT version mismatch. Without this, the next line
+            # raises AttributeError on None and the real cause is invisible.
+            raise RuntimeError(
+                f"TensorRT could not deserialize {os.path.basename(path)} "
+                f"(installed TensorRT: {trt.__version__}). This usually means the "
+                f"engine was built by a different TensorRT version. Delete the "
+                f".engine and .metadata files to force a rebuild."
+            )
         self._trt_ctx = self._trt_engine.create_execution_context()
 
         n = self._trt_engine.num_io_tensors
@@ -425,7 +647,13 @@ class YoloEngine(InferenceEngine):
         self._nms_in_model = (len(out_shape) == 3 and out_shape[2] == 6)
         logger.info(f"TRT output {out_shape} → {'post-NMS (skipping external NMS)' if self._nms_in_model else 'raw head (applying external NMS)'}")
 
-        # Warm-up
+        self._ensure_stream()
+
+        # Graphs recorded against a previous engine point at its freed memory.
+        self._graphs = {}
+        self._use_graphs = getattr(self, "_cuda_graphs", False)
+
+        # Warm-up (also records the batch-1 CUDA graph)
         dummy = torch.zeros(1, 3, self._inp_h, self._inp_w, device="cuda")
         self._trt_forward(dummy)
         logger.info(f"TRT engine ready — input '{self._trt_in}' {list(shape)}")
@@ -455,9 +683,33 @@ class YoloEngine(InferenceEngine):
 
     # ── Direct TRT path ────────────────────────────────────────────────────
 
+    def _ensure_stream(self):
+        """Create the dedicated preprocessing stream.
+
+        Lazy so that callers which set _inp_h/_inp_w without going through
+        _load_trt_direct (the unit tests) still work.
+        """
+        import torch
+        if getattr(self, "_stream", None) is None:
+            self._stream = torch.cuda.Stream()
+
     def _trt_forward(self, inp: "torch.Tensor") -> "torch.Tensor":
         """Execute the TRT engine on an (N,3,H,W) CUDA tensor."""
         import torch
+
+        # TensorRT reads the input through a raw data_ptr() and assumes a
+        # contiguous NCHW buffer. A permuted tensor (any HWC source) is a view
+        # with non-contiguous strides, so handing it over directly makes the
+        # engine read the wrong layout and silently return nothing. Batching
+        # used to hide this, because torch.cat materialises a contiguous copy;
+        # a single-frame batch passed straight through does not.
+        if not inp.is_contiguous():
+            inp = inp.contiguous()
+
+        if getattr(self, "_use_graphs", False) and getattr(self, "_stream", None) is not None:
+            out = self._trt_forward_graph(inp)
+            if out is not None:
+                return out
 
         batch = inp.shape[0]
         self._trt_ctx.set_input_shape(self._trt_in, list(inp.shape))
@@ -467,9 +719,92 @@ class YoloEngine(InferenceEngine):
 
         self._trt_ctx.set_tensor_address(self._trt_in,  inp.data_ptr())
         self._trt_ctx.set_tensor_address(self._trt_out, out.data_ptr())
-        self._trt_ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-        torch.cuda.synchronize()
+
+        # Run on the dedicated preprocessing stream rather than the default one.
+        # Preprocessing was issued there, so the engine is already ordered behind
+        # it; wait_stream additionally covers work still pending on the default
+        # stream, such as the output allocation above. TensorRT 11 warns
+        # explicitly that enqueueV3 on the default stream forces extra
+        # cudaStreamSynchronize calls.
+        stream = getattr(self, "_stream", None)
+        if stream is None:
+            self._trt_ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+            torch.cuda.synchronize()
+        else:
+            stream.wait_stream(torch.cuda.default_stream())
+            self._trt_ctx.execute_async_v3(stream.cuda_stream)
+            stream.synchronize()
         return out
+
+    def _trt_forward_graph(self, inp: "torch.Tensor"):
+        """Replay a CUDA graph of the TensorRT call recorded for this batch size.
+
+        enqueueV3 launches every kernel of the engine from the CPU, one at a
+        time; for yolo26x that measured ~2.2 ms per frame on a Ryzen 5825U. A
+        graph launches the whole sequence in one call. A graph replays the exact
+        shapes and buffer addresses it was recorded with, so each batch size gets
+        its own graph and its own fixed input/output buffers.
+
+        The returned tensor is the graph's output buffer: it is overwritten by
+        the next call. _run_trt finishes with it before returning, and only one
+        inference runs at a time per engine.
+
+        Returns None when this batch size cannot be recorded; the caller then
+        falls back to a normal enqueue for it. Other batch sizes keep their
+        graphs.
+        """
+        import torch
+
+        batch = inp.shape[0]
+        if batch not in self._graphs:
+            try:
+                self._graphs[batch] = self._record_graph(inp)
+                logger.info(f"CUDA graph recorded for batch {batch}")
+            except Exception as e:
+                self._graphs[batch] = None
+                logger.warning(f"CUDA graph recording failed for batch {batch}; "
+                               f"using normal enqueue for it: {e}")
+                torch.cuda.synchronize()
+        entry = self._graphs[batch]
+        if entry is None:
+            return None
+
+        graph, static_in, static_out = entry
+        stream = self._stream
+        stream.wait_stream(torch.cuda.default_stream())
+        with torch.cuda.stream(stream):
+            static_in.copy_(inp)
+            graph.replay()
+        stream.synchronize()
+        return static_out
+
+    def _record_graph(self, inp: "torch.Tensor"):
+        import torch
+
+        static_in = inp.clone()
+        # Returns False (and only logs) for a shape outside the engine's
+        # profile, e.g. batch 2 on an engine built with max_batch_size 1.
+        if not self._trt_ctx.set_input_shape(self._trt_in, list(inp.shape)):
+            raise ValueError(f"engine does not accept input shape {list(inp.shape)}")
+        out_shape = list(self._trt_ctx.get_tensor_shape(self._trt_out))
+        out_shape[0] = inp.shape[0]
+        static_out = torch.empty(out_shape, dtype=torch.float32, device="cuda")
+        self._trt_ctx.set_tensor_address(self._trt_in,  static_in.data_ptr())
+        self._trt_ctx.set_tensor_address(self._trt_out, static_out.data_ptr())
+
+        stream = self._stream
+        stream.wait_stream(torch.cuda.default_stream())
+        # TensorRT does deferred setup on the first enqueue after a shape
+        # change, and that setup cannot be recorded. Run once normally first.
+        self._trt_ctx.execute_async_v3(stream.cuda_stream)
+        stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        # thread_local: inference runs on a worker thread; only CUDA calls made
+        # from this thread are checked against the capture.
+        with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            self._trt_ctx.execute_async_v3(stream.cuda_stream)
+        return graph, static_in, static_out
 
     def _run_trt(self, frames_np) -> np.ndarray:
         import torch
@@ -483,22 +818,51 @@ class YoloEngine(InferenceEngine):
         batch  = len(frames)
 
         # ── Preprocess ────────────────────────────────────────────────────
-        tensors = []
-        for f in frames:
-            # Frigate may send CHW float32 (nchw input_tensor mode)
-            if (f.ndim == 3 and f.shape[0] in (1, 3)
-                    and f.shape[0] < f.shape[1] and f.shape[0] < f.shape[2]):
-                f = np.transpose(f, (1, 2, 0))
-                if f.dtype in (np.float32, np.float64):
-                    f = (f * 255).clip(0, 255).astype(np.uint8)
-            t = torch.as_tensor(f.copy(), device="cuda").float().div_(255.0)
-            t = t.permute(2, 0, 1).unsqueeze(0)   # (1, C, H, W)
-            tensors.append(t)
+        # Which wire format arrives is decided by Frigate's model.input_tensor
+        # and model.input_dtype, and they cost very different amounts:
+        #
+        #   float32 CHW  uploaded to the GPU as-is. For input_dtype: float the
+        #                pixels are already normalised, so the CPU never touches
+        #                them -- no transpose, no uint8 round trip.
+        #   uint8        uploaded directly and scaled on the GPU. Staging this
+        #                through a pinned buffer was benchmarked and is slower:
+        #                the extra host-side copy costs more than the async DMA
+        #                saves.
+        #   float32 HWC  uploaded directly and permuted on the GPU.
+        #
+        # Normalization follows the wire dtype rather than pixel values: a
+        # near-black uint8 frame reads as already-normalised to a value sniff,
+        # which would skip the divide and hand the model a 255x over-bright
+        # image. The float paths keep a value check so Frigate's float_denorm
+        # mode, which sends float32 still in 0-255, is scaled correctly.
+        self._ensure_stream()
+        with torch.cuda.stream(self._stream):
+            tensors = []
+            for f in frames:
+                is_chw = (f.ndim == 3 and f.shape[0] in (1, 3)
+                          and f.shape[0] < f.shape[1] and f.shape[0] < f.shape[2])
 
-        inp = torch.cat(tensors, dim=0)            # (N, C, H, W)
-        if inp.shape[2] != self._inp_h or inp.shape[3] != self._inp_w:
-            inp = F.interpolate(inp, (self._inp_h, self._inp_w),
-                                mode="bilinear", align_corners=False)
+                if np.issubdtype(f.dtype, np.integer):
+                    if is_chw:
+                        f = np.ascontiguousarray(np.transpose(f, (1, 2, 0)))
+                    t = (torch.as_tensor(np.ascontiguousarray(f), device="cuda")
+                              .float().div_(255.0).permute(2, 0, 1).unsqueeze(0))
+                else:
+                    t = torch.as_tensor(np.ascontiguousarray(f), device="cuda").float()
+                    t = t.unsqueeze(0) if is_chw else t.permute(2, 0, 1).unsqueeze(0)
+                    if t.max() > 1.5:        # float_denorm: float32 still in 0-255
+                        t.div_(255.0)
+                tensors.append(t)
+
+            # The contiguous copy and the resize must stay inside this block. A
+            # single uint8 frame is a permuted view; _trt_forward would make it
+            # contiguous on the default stream, which does not wait for this
+            # one, and TensorRT got a partly converted frame (raw scores off by
+            # up to 0.89 between two runs of the same frame).
+            inp = tensors[0].contiguous() if len(tensors) == 1 else torch.cat(tensors, dim=0)
+            if inp.shape[2] != self._inp_h or inp.shape[3] != self._inp_w:
+                inp = F.interpolate(inp, (self._inp_h, self._inp_w),
+                                    mode="bilinear", align_corners=False)
 
         raw = self._trt_forward(inp)
 
@@ -541,35 +905,37 @@ class YoloEngine(InferenceEngine):
         # Norfair's distance function and crash the camera processor process.
         area = (x2 - x1) * (y2 - y1)              # (N, 8400)
 
-        results = []
+        # One pass for the whole batch. mask.any() and boolean-mask indexing
+        # each make the CPU wait for the GPU, and the per-frame loop did that
+        # about six times per frame. nonzero() waits once per batch. Shifting
+        # each frame's boxes by 2x its index (boxes are clamped to 0-1) keeps
+        # NMS within a frame -- the same trick torchvision's batched_nms uses.
+        results = np.zeros((batch, self.max_dets, 6), np.float32)
+        img, anc = ((conf > CONF) & (area > 0)).nonzero(as_tuple=True)
+        if img.numel() == 0:
+            return results
+
+        bi = boxes[img, anc]          # (K, 4)
+        ci = conf[img, anc]           # (K,)
+        keep = tvops.nms(bi + img[:, None].to(bi.dtype) * 2.0, ci, IOU)  # score-descending
+
+        bk = bi[keep]
+        # Single CPU transfer for all kept detections; column 0 is the frame
+        # index, the rest is Frigate's (class, conf, y1, x1, y2, x2).
+        kept = torch.stack([
+            img[keep].float(),
+            cls_idx[img, anc][keep].float(),
+            ci[keep],
+            bk[:, 1],   # y1
+            bk[:, 0],   # x1
+            bk[:, 3],   # y2
+            bk[:, 2],   # x2
+        ], dim=1).cpu().numpy()
+
         for i in range(batch):
-            mask = (conf[i] > CONF) & (area[i] > 0)
-            if not mask.any():
-                results.append(np.zeros((self.max_dets, 6), np.float32))
-                continue
-
-            bi  = boxes[i][mask]      # (K, 4)
-            ci  = conf[i][mask]       # (K,)
-            cli = cls_idx[i][mask]    # (K,)
-
-            keep = tvops.nms(bi, ci, IOU)[:self.max_dets]
-            n    = len(keep)
-
-            # Single CPU transfer for all kept detections
-            kept = torch.stack([
-                cli[keep].float(),
-                ci[keep],
-                bi[keep, 1],   # y1 (Frigate: class, conf, y1, x1, y2, x2)
-                bi[keep, 0],   # x1
-                bi[keep, 3],   # y2
-                bi[keep, 2],   # x2
-            ], dim=1).cpu().numpy()
-
-            out = np.zeros((self.max_dets, 6), np.float32)
-            out[:n] = kept
-            results.append(out)
-
-        return np.array(results)
+            rows = kept[kept[:, 0] == i, 1:][:self.max_dets]
+            results[i, :len(rows)] = rows
+        return results
 
     # ── Ultralytics fallback ───────────────────────────────────────────────
 
