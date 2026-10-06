@@ -40,8 +40,8 @@ headroom for a significant number of cameras at 5 fps detection rates.
 your model and Frigate transfers it to the inference engine automatically over ZMQ on first
 run. No manual file placement needed. See
 [config/frigate-detector.yaml](config/frigate-detector.yaml) for the Frigate config snippet.
-Once transferred, run `tools/optimize.py` to compile it to a TRT engine for maximum
-performance.
+The TRT engine is compiled automatically on first use — see
+[TensorRT optimization](#tensorrt-optimization) below.
 
 Any other YOLO-format model that ultralytics can load (`.pt`, `.onnx`) also works.
 
