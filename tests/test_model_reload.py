@@ -10,8 +10,13 @@ Run inside the image, from the repo root:
         frigate-inference:sm_75_121 python3 -m unittest -v tests.test_model_reload
 """
 import os
+import shutil
 import tempfile
 import unittest
+
+# Must match the image: YoloEngine refuses to start when PASCAL_COMPAT
+# disagrees with the installed TensorRT, so hardcoding it fails on sm_61.
+_PASCAL_COMPAT = os.environ.get("PASCAL_COMPAT", "0").strip().lower() in ("1", "true", "yes", "on")
 
 try:
     from inference_engine.engines.yolo_engine import YoloEngine
@@ -44,8 +49,11 @@ class ModelReloadTest(unittest.TestCase):
         self.checks, self.loads = checks, loads
         self.engine = _Stub(device="cpu", model_dir=self.dir, max_dets=20,
                             precision="fp32", optimize="always", max_batch_size=1,
-                            pascal_compat=False)
+                            pascal_compat=_PASCAL_COMPAT)
         self.path = os.path.join(self.dir, "m.onnx")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
 
     def test_repeat_request_skips_check(self):
         for _ in range(5):
