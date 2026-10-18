@@ -1,5 +1,69 @@
 # Changelog
 
+## v1.3 (2026-10-19)
+
+Rebuild required.
+
+- **Resolve the input transform once, instead of re-deciding it per frame.**
+  `_run_trt` used to re-run a layout heuristic, a dtype branch and a resize
+  check on every frame, and on the float path a `t.max() > 1.5` value sniff
+  that forced a device-to-host sync each time. The wire format is now resolved
+  into an `InputPlan` the first time it is seen and cached next to the CUDA
+  graphs, so the hot path replays a fixed sequence. Plans are discarded when a
+  model is loaded, like the graphs they sit beside.
+
+- **Read the input geometry from the engine instead of assuming NCHW.**
+  `_load_trt_direct` took `shape[2]` and `shape[3]` as height and width, so an
+  NHWC binding silently resolved to 3x3. The channel axis is now identified,
+  the binding dtype is read, and the result is logged. A client that declares
+  an `input_tensor` disagreeing with the binding gets a warning rather than a
+  misread frame.
+
+- **Extend the CUDA graph over preprocessing, not just the engine call.** The
+  graph used to start after preprocessing, so every frame still paid Python
+  dispatch for the transform plus a device-to-device copy of the converted
+  tensor into the graph's input buffer. The frame is now copied straight into
+  a static wire-format buffer and one replay does the transform and the
+  inference. Verified bit-identical to the eager path over random frames on a
+  real engine, and deterministic across replays. Plans that need a value sniff
+  cannot be captured and keep running eagerly.
+
+- **Honour the model format a client declares.** When a request header carries
+  `input_dtype`, the engine applies that model's convention: `float` is scaled
+  to 0-1, `float_denorm` and `int` are left in 0-255. Previously the engine
+  always produced 0-1, which is right for every model shipped against it so
+  far and wrong for the other two classes -- a `float_denorm` model was handed
+  a frame 255x too dark in both offload and non-offload modes.
+
+  **This is backward compatible.** With no declaration the engine keeps its
+  previous behaviour exactly: integer frames are scaled, float frames are
+  scaled only if they look denormalized. Existing clients are unaffected.
+
+  Frigate sends these fields when the `offload_input_transform` option is set
+  on its `zmq` detector. They are sent per request rather than at `load_model`
+  on purpose: a worker can lazily load the active model from
+  `shared_model_name` without ever having seen the handshake, so load-time
+  format state would silently desync, and the failure mode is an invisibly
+  wrong frame rather than an error.
+
+- **Document how to get the uint8 wire format on a `plus://` model.** The
+  `input_dtype: int` setting described under *Two independent "data type"
+  settings* works on a normal model path, but Frigate's
+  `check_and_load_plus_model()` assigns `input_tensor`, `input_pixel_format`
+  and `input_dtype` from the Frigate+ metadata unconditionally, so on a
+  `plus://` path the setting is silently discarded and frames arrive as
+  float32 NCHW. Editing the cached `model_cache/<id>.json` is not a fix: it is
+  a cache keyed on file existence, so deleting it makes Frigate refetch and
+  revert the edit, and the same file supplies `labelMap`, so editing it risks
+  desyncing class names from the weights.
+
+  Measured on a 640x640 region, Frigate's host-side cost per detection drops
+  from 4.47 ms to 0.31 ms and the payload from 4.9 MB to 1.2 MB. Almost all of
+  it is `tobytes()`: `np.transpose` returns a view and `astype` keeps its
+  strides by default, so the transpose is deferred to serialization, where it
+  becomes a strided gather over the whole float32 tensor (3.97 ms of the
+  4.47 ms). The YUV to RGB conversion is unaffected and stays on the host.
+
 ## v1.2 (2026-09-30)
 
 > **Upgrading — rebuild both images, don't just pull the code.**

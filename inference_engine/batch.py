@@ -156,6 +156,11 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
             else:
                 shape = tuple(header["shape"])
                 dtype = np.dtype(header.get("dtype", "uint8"))
+                # What the model expects, when the client says. Absent means
+                # no declaration, and the engine keeps its previous
+                # assumption that the model wants 0-1.
+                engine.declared_input_dtype = header.get("input_dtype")
+                engine.declared_input_tensor = header.get("input_tensor")
                 frame = np.frombuffer(msg[3], dtype=dtype).reshape(shape)
                 if frame.ndim == 4:
                     frame = frame[0]

@@ -161,3 +161,161 @@ class PrecisionEnforcementTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_CUDA, "requires a CUDA device (_run_trt is cuda-only)")
+class DeclaredFormatTest(unittest.TestCase):
+    """A client may declare what the model wants; the engine honours it.
+
+    Without a declaration the engine assumes 0-1, which is what every client
+    relied on before these fields existed and what InputNormalizationTest
+    above pins down. With one, the model's own convention wins -- a
+    float_denorm or int model is no longer silently handed 0-1.
+    """
+
+    def setUp(self):
+        captured = {}
+
+        class _CapturingEngine(YoloEngine):
+            def _trt_forward(self, inp):
+                torch.cuda.current_stream().wait_stream(self._stream)
+                captured["inp"] = inp.detach().clone()
+                return torch.zeros(inp.shape[0], 6, 10, device="cuda")
+
+        self.captured = captured
+        self.engine = _CapturingEngine(
+            device="cuda:0", model_dir="/models", max_dets=20,
+            precision="fp16", optimize="never", max_batch_size=1,
+            pascal_compat=_PASCAL_COMPAT,
+        )
+        self.engine._trt_ctx = object()
+        self.engine._nms_in_model = False
+        self.engine._inp_h = self.engine._inp_w = SIZE
+
+    def _max_sent(self, frame, declared):
+        self.engine.declared_input_dtype = declared
+        self.captured.clear()
+        self.engine._run_trt([frame])
+        return float(self.captured["inp"].max())
+
+    def test_declared_float_scales_uint8(self):
+        """input_dtype float: the model wants 0-1, so 255 becomes 1.0."""
+        frame = np.full((SIZE, SIZE, 3), 255, dtype=np.uint8)
+        self.assertAlmostEqual(self._max_sent(frame, "float"), 1.0, places=4)
+
+    def test_declared_float_denorm_leaves_uint8_unscaled(self):
+        """input_dtype float_denorm: the model wants 0-255, so do not divide.
+
+        The engine used to divide here regardless, handing such a model a
+        frame 255x too dark.
+        """
+        frame = np.full((SIZE, SIZE, 3), 255, dtype=np.uint8)
+        self.assertAlmostEqual(self._max_sent(frame, "float_denorm"), 255.0, places=2)
+
+    def test_declared_int_leaves_uint8_unscaled(self):
+        """input_dtype int: the model takes raw bytes."""
+        frame = np.full((SIZE, SIZE, 3), 255, dtype=np.uint8)
+        self.assertAlmostEqual(self._max_sent(frame, "int"), 255.0, places=2)
+
+    def test_declaration_is_reversible(self):
+        """Clearing the declaration restores the undeclared assumption."""
+        frame = np.full((SIZE, SIZE, 3), 255, dtype=np.uint8)
+        self.assertAlmostEqual(self._max_sent(frame, "float_denorm"), 255.0, places=2)
+        self.assertAlmostEqual(self._max_sent(frame, None), 1.0, places=4)
+
+    def test_chw_uint8_is_permuted_on_the_gpu(self):
+        """A CHW frame reaches TRT as NCHW without a host-side transpose."""
+        frame = np.zeros((3, SIZE, SIZE), dtype=np.uint8)
+        frame[1] = 255                      # green channel only
+        self.engine.declared_input_dtype = None
+        self.captured.clear()
+        self.engine._run_trt([frame])
+        inp = self.captured["inp"]
+        self.assertEqual(tuple(inp.shape), (1, 3, SIZE, SIZE))
+        self.assertAlmostEqual(float(inp[0, 0].max()), 0.0, places=5)
+        self.assertAlmostEqual(float(inp[0, 1].max()), 1.0, places=4)
+
+    def test_plan_is_resolved_once_per_wire_format(self):
+        """The transform is cached, not re-decided per frame."""
+        frame = np.full((SIZE, SIZE, 3), 255, dtype=np.uint8)
+        self.engine.declared_input_dtype = None
+        self.engine._plans.clear()
+        for _ in range(3):
+            self.engine._run_trt([frame])
+        self.assertEqual(len(self.engine._plans), 1)
+
+        # A different wire format gets its own plan rather than reusing one.
+        self.engine._run_trt([np.full((SIZE, SIZE, 3), 1.0, dtype=np.float32)])
+        self.assertEqual(len(self.engine._plans), 2)
+
+
+class BindingIntrospectionTest(unittest.TestCase):
+    """Input geometry is read from the binding, not assumed to be NCHW.
+
+    The old code took shape[2] and shape[3] as height and width, so an NHWC
+    engine silently resolved to 3x3. Runs without a GPU.
+    """
+
+    @staticmethod
+    def _introspect(dims):
+        from inference_engine.engines.yolo_engine import YoloEngine
+
+        eng = YoloEngine.__new__(YoloEngine)
+        eng._trt_in = "images"
+        eng._trt_engine = None          # forces the dtype fallback
+        eng.declared_input_tensor = None
+        return YoloEngine._introspect_binding(eng, dims)
+
+    def test_nchw_binding(self):
+        fmt = self._introspect([1, 3, 640, 480])
+        self.assertEqual((fmt.layout, fmt.height, fmt.width), ("nchw", 640, 480))
+
+    def test_nhwc_binding(self):
+        fmt = self._introspect([1, 640, 480, 3])
+        self.assertEqual((fmt.layout, fmt.height, fmt.width), ("nhwc", 640, 480))
+
+    def test_dynamic_batch_is_fine(self):
+        fmt = self._introspect([-1, 3, 640, 640])
+        self.assertEqual((fmt.layout, fmt.height, fmt.width), ("nchw", 640, 640))
+
+    def test_non_4d_binding_raises(self):
+        with self.assertRaises(RuntimeError):
+            self._introspect([1, 3, 640])
+
+
+@unittest.skipUnless(_CUDA, "requires a CUDA device (_run_trt is cuda-only)")
+class DeclarationCrossCheckTest(unittest.TestCase):
+    """A declared layout that disagrees with the binding must be reported.
+
+    The check runs at plan resolution, not at model load: the model is loaded
+    before any request arrives, so at load time nothing has been declared and
+    the warning would never fire.
+    """
+
+    def setUp(self):
+        class _Engine(YoloEngine):
+            def _trt_forward(self, inp):
+                torch.cuda.current_stream().wait_stream(self._stream)
+                return torch.zeros(inp.shape[0], 6, 10, device="cuda")
+
+        self.engine = _Engine(
+            device="cuda:0", model_dir="/models", max_dets=20,
+            precision="fp16", optimize="never", max_batch_size=1,
+            pascal_compat=_PASCAL_COMPAT,
+        )
+        self.engine._trt_ctx = object()
+        self.engine._nms_in_model = False
+        self.engine._inp_h = self.engine._inp_w = SIZE
+        self.frame = np.full((SIZE, SIZE, 3), 255, dtype=np.uint8)
+
+    def test_mismatched_layout_warns(self):
+        self.engine.declared_input_tensor = "nhwc"      # binding is nchw
+        with self.assertLogs("yolo_engine", level="WARNING") as cm:
+            self.engine._run_trt([self.frame])
+        self.assertTrue(any("compiled binding is nchw" in m for m in cm.output))
+
+    def test_matching_layout_is_quiet(self):
+        self.engine.declared_input_tensor = "nchw"
+        with self.assertLogs("yolo_engine", level="INFO") as cm:
+            self.engine._run_trt([self.frame])
+        self.assertFalse(any("Client declares" in m for m in cm.output))

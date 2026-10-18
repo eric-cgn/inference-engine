@@ -316,6 +316,15 @@ These are easy to confuse. They are unrelated and set in different places:
 instead of Frigate's CPU. See [Wire format](#wire-format) — it is worth **+17% on an RTX
 2060 and +26% on a GTX 1050 Ti**, and applies to every card.
 
+**On a `plus://` model this setting is silently ignored.** Frigate assigns
+`input_tensor`, `input_pixel_format` and `input_dtype` from the Frigate+ metadata
+unconditionally, so frames arrive as float32 NCHW no matter what the config says. Do not
+work around it by editing `model_cache/<id>.json` — that file is a cache keyed on
+existence, so deleting it reverts the edit, and it also supplies `labelMap`, so editing it
+risks desyncing class names from the weights. The fix is the `offload_input_transform`
+option on Frigate's `zmq` detector, which sends the frame as captured and leaves the
+Frigate+ model config alone. It is not in a Frigate release yet.
+
 ### Precision and your GPU
 
 `precision` is validated against the card at startup and downgraded, with a warning,

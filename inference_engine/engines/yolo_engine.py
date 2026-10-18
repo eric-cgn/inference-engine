@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
 import numpy as np
 
 # Frigate Plus model names are MD5 hashes (32 lowercase hex chars).
@@ -14,6 +15,36 @@ _HASH_RE = re.compile(r'^[0-9a-f]{32,}$')
 logger = logging.getLogger("yolo_engine")
 
 from ..engine import InferenceEngine
+
+
+@dataclass(frozen=True)
+class ModelFormat:
+    """What the compiled engine expects, read from its input binding.
+
+    layout, height, width and dtype are facts introspected from the .engine.
+    `norm` is not: no graph records whether it was trained on 0-1 or 0-255
+    pixels, so it is either declared by the client or assumed to be "float".
+    """
+    layout: str          # "nchw" | "nhwc"
+    height: int
+    width: int
+    dtype: str           # binding dtype, e.g. "float32"
+    norm: str = "float"  # "float" (0-1) | "float_denorm" (0-255) | "int"
+
+
+@dataclass(frozen=True)
+class InputPlan:
+    """A resolved wire-format -> binding transform.
+
+    Built once per wire format and cached, so the per-frame path replays a
+    fixed sequence instead of re-deciding. `deterministic` is False when the
+    scale decision came from sniffing pixel values, which cannot be captured
+    into a CUDA graph because it needs a device-to-host read.
+    """
+    src_layout: str      # "nchw" | "nhwc"
+    scale: bool          # divide by 255
+    resize: bool
+    deterministic: bool
 
 
 class YoloEngine(InferenceEngine):
@@ -46,6 +77,17 @@ class YoloEngine(InferenceEngine):
         from ..config import _env_bool
         self._cuda_graphs = _env_bool("CUDA_GRAPHS", True)
         self._graphs = {}
+        self._input_graphs = {}
+        # Resolved input plans, keyed by wire format. Derived per-process
+        # state like _graphs, and discarded with it when a model is loaded.
+        self._plans = {}
+        self._model_fmt = None
+        # Last format declared by a client, set per request by the decoder.
+        # Absent means "no declaration": the engine falls back to assuming
+        # the model wants 0-1, which is what every client expected before
+        # these fields existed.
+        self.declared_input_dtype = None
+        self.declared_input_tensor = None
 
     def _validate_trt_profile(self):
         """
@@ -638,8 +680,9 @@ class YoloEngine(InferenceEngine):
                 self._trt_out = name
 
         shape = self._trt_engine.get_tensor_shape(self._trt_in)
-        self._inp_h = shape[2]   # 640
-        self._inp_w = shape[3]   # 640
+        self._model_fmt = self._introspect_binding(shape)
+        self._inp_h = self._model_fmt.height
+        self._inp_w = self._model_fmt.width
 
         out_shape = list(self._trt_engine.get_tensor_shape(self._trt_out))
         # Post-NMS engines output (N, K, 6): x1,y1,x2,y2,conf,cls — already filtered.
@@ -649,8 +692,11 @@ class YoloEngine(InferenceEngine):
 
         self._ensure_stream()
 
-        # Graphs recorded against a previous engine point at its freed memory.
+        # Graphs recorded against a previous engine point at its freed memory,
+        # and plans resolved against its binding no longer describe this one.
         self._graphs = {}
+        self._input_graphs = {}
+        self._plans = {}
         self._use_graphs = getattr(self, "_cuda_graphs", False)
 
         # Warm-up (also records the batch-1 CUDA graph)
@@ -682,6 +728,270 @@ class YoloEngine(InferenceEngine):
         return self._run_ultralytics(frames_np)
 
     # ── Direct TRT path ────────────────────────────────────────────────────
+
+    def _introspect_binding(self, shape) -> ModelFormat:
+        """Derive the model's input format from its TRT binding.
+
+        Replaces the old assumption that index 2 and 3 are always H and W.
+        An NHWC engine used to yield height = width = 3 here, silently.
+        """
+        import tensorrt as trt
+
+        dims = list(shape)
+        if len(dims) != 4:
+            raise RuntimeError(
+                f"expected a 4D input binding, got {dims} for '{self._trt_in}'"
+            )
+
+        chw = dims[1] in (1, 3)
+        hwc = dims[3] in (1, 3)
+        if chw and not hwc:
+            layout, h, w = "nchw", dims[2], dims[3]
+        elif hwc and not chw:
+            layout, h, w = "nhwc", dims[1], dims[2]
+        else:
+            # A 3x3 input, or no channel axis we recognise. NCHW is what every
+            # YOLO export uses, so assume it but say so.
+            layout, h, w = "nchw", dims[2], dims[3]
+            logger.warning(
+                f"Could not identify the channel axis in input binding {dims}; "
+                f"assuming NCHW ({h}x{w})"
+            )
+
+        try:
+            dtype = trt.nptype(self._trt_engine.get_tensor_dtype(self._trt_in)).__name__
+        except Exception:
+            dtype = "float32"
+
+        fmt = ModelFormat(layout=layout, height=h, width=w, dtype=str(dtype))
+        logger.info(f"Model input format: {layout} {h}x{w} {dtype}")
+        return fmt
+
+    def _check_declaration(self, fmt: ModelFormat) -> None:
+        """Warn when a client's declared layout disagrees with the binding.
+
+        The declaration describes what the model wants; the binding is what it
+        was compiled with. A mismatch means one of them is wrong, and the
+        result is a silently misread frame rather than an error.
+
+        Called from plan resolution rather than from model load: the model is
+        loaded before any request arrives, so at load time nothing has been
+        declared yet and the check would never fire.
+        """
+        declared = self.declared_input_tensor
+        if declared and declared != fmt.layout:
+            logger.warning(
+                f"Client declares the model input is {declared}, but the "
+                f"compiled binding is {fmt.layout}. Using the binding."
+            )
+
+    def _model_format(self) -> ModelFormat:
+        """The active model format, with the declared normalization applied.
+
+        Falls back to NCHW at _inp_h/_inp_w for callers that set those
+        directly without loading a real engine (the unit tests do this).
+        """
+        fmt = self._model_fmt
+        if fmt is None:
+            fmt = ModelFormat(layout="nchw", height=self._inp_h,
+                              width=self._inp_w, dtype="float32")
+        norm = self.declared_input_dtype or "float"
+        if norm == fmt.norm:
+            return fmt
+        return ModelFormat(layout=fmt.layout, height=fmt.height,
+                           width=fmt.width, dtype=fmt.dtype, norm=norm)
+
+    def _resolve_plan(self, frame, fmt: ModelFormat) -> InputPlan:
+        """Work out, once, how to get `frame` into the model's binding."""
+        is_int = bool(np.issubdtype(frame.dtype, np.integer))
+
+        # The wire layout is a fact about the bytes in hand, so it is read from
+        # the shape. A client's input_tensor describes the *model*, not the
+        # payload -- under offload the frame is sent as captured (NHWC)
+        # whatever layout the model wants -- so it is only cross-checked.
+        src_layout = "nchw" if (
+            frame.ndim == 3 and frame.shape[0] in (1, 3)
+            and frame.shape[0] < frame.shape[1]
+            and frame.shape[0] < frame.shape[2]
+        ) else "nhwc"
+
+        if self.declared_input_dtype is not None:
+            # Declared: integer payloads are raw 0-255 bytes and need scaling
+            # only if the model wants 0-1. Float payloads already arrive in the
+            # model's units, because that is what the declaration means.
+            scale = is_int and fmt.norm == "float"
+            deterministic = True
+        elif is_int:
+            # Undeclared integers are 0-255, and every model shipped against
+            # this engine wants 0-1. Normalization follows the wire dtype and
+            # never the pixel values: a near-black uint8 frame sniffs as
+            # already-normalised and would reach the model 255x too bright.
+            scale, deterministic = True, True
+        else:
+            # Undeclared float is the only case left where the range has to be
+            # guessed from the data, so it stays a per-frame check -- and that
+            # read bars the frame from the preprocessing graph.
+            scale, deterministic = True, False
+
+        if src_layout == "nchw":
+            h, w = frame.shape[1], frame.shape[2]
+        else:
+            h, w = frame.shape[0], frame.shape[1]
+
+        return InputPlan(
+            src_layout=src_layout,
+            scale=scale,
+            resize=(h != fmt.height or w != fmt.width),
+            deterministic=deterministic,
+        )
+
+    def _apply_plan(self, t, plan: InputPlan, fmt: ModelFormat):
+        """Execute a resolved plan on a CUDA tensor already in wire layout.
+
+        One fixed sequence, no branching on pixel values and no device-to-host
+        reads, which is what makes it capturable into a CUDA graph.
+        """
+        import torch.nn.functional as F
+
+        t = t.float()
+        if plan.src_layout == "nhwc":
+            t = t.permute(0, 3, 1, 2)
+        # TensorRT reads a raw pointer and assumes contiguous NCHW, so a
+        # permuted view has to be materialised before it is handed over.
+        t = t.contiguous()
+        if plan.scale:
+            t.div_(255.0)
+        if plan.resize:
+            t = F.interpolate(t, (fmt.height, fmt.width),
+                              mode="bilinear", align_corners=False)
+        return t
+
+    def _plan_for(self, frame, fmt: ModelFormat) -> InputPlan:
+        """Resolved plan for this wire format, computed once and cached."""
+        key = (tuple(frame.shape), frame.dtype.str, fmt)
+        plan = self._plans.get(key)
+        if plan is None:
+            plan = self._resolve_plan(frame, fmt)
+            self._plans[key] = plan
+            self._check_declaration(fmt)
+            # Say whether norm came from the client or from the fallback:
+            # both commonly resolve to "float", so the value alone does not
+            # tell you whether the declaration arrived.
+            src = ("declared" if self.declared_input_dtype is not None
+                   else "assumed")
+            logger.info(
+                f"Input plan for {frame.dtype.str} {tuple(frame.shape)} -> "
+                f"{fmt.layout} {fmt.height}x{fmt.width} norm={fmt.norm} "
+                f"({src}): layout={plan.src_layout} scale={plan.scale} "
+                f"resize={plan.resize} graphable={plan.deterministic}"
+            )
+        return plan
+
+    def _upload(self, frames):
+        """Host -> device for a batch of wire-format frames."""
+        import torch
+
+        ts = [torch.as_tensor(np.ascontiguousarray(f), device="cuda")
+              for f in frames]
+        return ts[0].unsqueeze(0) if len(ts) == 1 else torch.stack(ts)
+
+    def _forward_eager(self, frames, plan: InputPlan, fmt: ModelFormat):
+        """Run the plan as ordinary torch calls, then the engine."""
+        import torch
+
+        with torch.cuda.stream(self._stream):
+            t = self._upload(frames)
+            if not plan.deterministic:
+                # Undeclared float: the only range check left, and the reason
+                # this plan cannot be graphed. Resolved per frame, as before.
+                plan = InputPlan(plan.src_layout, bool(t.max() > 1.5),
+                                 plan.resize, False)
+            # The plan must stay inside this block. A permuted view made
+            # contiguous on the default stream, which does not wait for this
+            # one, handed TensorRT a partly converted frame (raw scores off by
+            # up to 0.89 between two runs of the same frame).
+            inp = self._apply_plan(t, plan, fmt)
+        return self._trt_forward(inp)
+
+    def _forward_input_graph(self, frames, plan: InputPlan, fmt: ModelFormat):
+        """Replay a graph covering preprocessing *and* the engine.
+
+        The old graph started after preprocessing, so every frame still paid
+        Python dispatch for the transform plus a device-to-device copy into
+        the graph's input buffer. Here the frame is copied straight into a
+        static wire-format buffer and one replay does the rest.
+
+        Returns None when this format cannot be recorded; the caller then runs
+        the plan eagerly for it, and other formats keep their graphs.
+        """
+        import torch
+
+        key = (len(frames), tuple(frames[0].shape), frames[0].dtype.str, plan)
+        if key not in self._input_graphs:
+            try:
+                self._input_graphs[key] = self._record_input_graph(frames, plan, fmt)
+                logger.info(f"CUDA graph recorded for input {key[:3]}")
+            except Exception as e:
+                self._input_graphs[key] = None
+                logger.warning(
+                    f"CUDA graph recording failed for input {key[:3]}; "
+                    f"running the plan eagerly for it: {e}"
+                )
+                torch.cuda.synchronize()
+
+        entry = self._input_graphs[key]
+        if entry is None:
+            return None
+
+        graph, static_wire, static_out = entry
+        stream = self._stream
+        stream.wait_stream(torch.cuda.default_stream())
+        with torch.cuda.stream(stream):
+            for i, f in enumerate(frames):
+                static_wire[i].copy_(torch.from_numpy(np.ascontiguousarray(f)))
+            graph.replay()
+        stream.synchronize()
+        return static_out
+
+    def _record_input_graph(self, frames, plan: InputPlan, fmt: ModelFormat):
+        import torch
+
+        n = len(frames)
+        sample = np.ascontiguousarray(frames[0])
+        static_wire = torch.empty(
+            (n, *sample.shape),
+            dtype=torch.from_numpy(sample).dtype,
+            device="cuda",
+        )
+        for i, f in enumerate(frames):
+            static_wire[i].copy_(torch.from_numpy(np.ascontiguousarray(f)))
+
+        stream = self._stream
+        stream.wait_stream(torch.cuda.default_stream())
+
+        # TensorRT does deferred setup on the first enqueue after a shape
+        # change and that setup cannot be recorded, so run the whole sequence
+        # once normally before capturing it.
+        with torch.cuda.stream(stream):
+            probe = self._apply_plan(static_wire, plan, fmt)
+        if not self._trt_ctx.set_input_shape(self._trt_in, list(probe.shape)):
+            raise ValueError(f"engine does not accept input shape {list(probe.shape)}")
+        out_shape = list(self._trt_ctx.get_tensor_shape(self._trt_out))
+        out_shape[0] = n
+        static_out = torch.empty(out_shape, dtype=torch.float32, device="cuda")
+        self._trt_ctx.set_tensor_address(self._trt_in, probe.data_ptr())
+        self._trt_ctx.set_tensor_address(self._trt_out, static_out.data_ptr())
+        self._trt_ctx.execute_async_v3(stream.cuda_stream)
+        stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            # Allocated from the graph's private pool, so this address is the
+            # same on every replay and the engine can be pointed at it here.
+            inp = self._apply_plan(static_wire, plan, fmt)
+            self._trt_ctx.set_tensor_address(self._trt_in, inp.data_ptr())
+            self._trt_ctx.execute_async_v3(stream.cuda_stream)
+        return graph, static_wire, static_out
 
     def _ensure_stream(self):
         """Create the dedicated preprocessing stream.
@@ -808,7 +1118,6 @@ class YoloEngine(InferenceEngine):
 
     def _run_trt(self, frames_np) -> np.ndarray:
         import torch
-        import torch.nn.functional as F
         import torchvision.ops as tvops
 
         if isinstance(frames_np, np.ndarray):
@@ -818,53 +1127,25 @@ class YoloEngine(InferenceEngine):
         batch  = len(frames)
 
         # ── Preprocess ────────────────────────────────────────────────────
-        # Which wire format arrives is decided by Frigate's model.input_tensor
-        # and model.input_dtype, and they cost very different amounts:
+        # Which wire format arrives is decided by the client. Frigate applies
+        # the model's layout and dtype itself unless the transform is
+        # offloaded, in which case the frame is sent as captured: uint8 NHWC,
+        # the cheapest thing it can produce and the smallest on the wire.
         #
-        #   float32 CHW  uploaded to the GPU as-is. For input_dtype: float the
-        #                pixels are already normalised, so the CPU never touches
-        #                them -- no transpose, no uint8 round trip.
-        #   uint8        uploaded directly and scaled on the GPU. Staging this
-        #                through a pinned buffer was benchmarked and is slower:
-        #                the extra host-side copy costs more than the async DMA
-        #                saves.
-        #   float32 HWC  uploaded directly and permuted on the GPU.
-        #
-        # Normalization follows the wire dtype rather than pixel values: a
-        # near-black uint8 frame reads as already-normalised to a value sniff,
-        # which would skip the divide and hand the model a 255x over-bright
-        # image. The float paths keep a value check so Frigate's float_denorm
-        # mode, which sends float32 still in 0-255, is scaled correctly.
+        # The transform from that wire format to the model's binding is
+        # resolved once per format into an InputPlan and then replayed, so no
+        # per-frame branching or value sniffing is left in the hot path. A
+        # deterministic plan is recorded into a CUDA graph together with the
+        # engine call; anything else runs the same plan eagerly.
         self._ensure_stream()
-        with torch.cuda.stream(self._stream):
-            tensors = []
-            for f in frames:
-                is_chw = (f.ndim == 3 and f.shape[0] in (1, 3)
-                          and f.shape[0] < f.shape[1] and f.shape[0] < f.shape[2])
+        fmt = self._model_format()
+        plan = self._plan_for(frames[0], fmt)
 
-                if np.issubdtype(f.dtype, np.integer):
-                    if is_chw:
-                        f = np.ascontiguousarray(np.transpose(f, (1, 2, 0)))
-                    t = (torch.as_tensor(np.ascontiguousarray(f), device="cuda")
-                              .float().div_(255.0).permute(2, 0, 1).unsqueeze(0))
-                else:
-                    t = torch.as_tensor(np.ascontiguousarray(f), device="cuda").float()
-                    t = t.unsqueeze(0) if is_chw else t.permute(2, 0, 1).unsqueeze(0)
-                    if t.max() > 1.5:        # float_denorm: float32 still in 0-255
-                        t.div_(255.0)
-                tensors.append(t)
-
-            # The contiguous copy and the resize must stay inside this block. A
-            # single uint8 frame is a permuted view; _trt_forward would make it
-            # contiguous on the default stream, which does not wait for this
-            # one, and TensorRT got a partly converted frame (raw scores off by
-            # up to 0.89 between two runs of the same frame).
-            inp = tensors[0].contiguous() if len(tensors) == 1 else torch.cat(tensors, dim=0)
-            if inp.shape[2] != self._inp_h or inp.shape[3] != self._inp_w:
-                inp = F.interpolate(inp, (self._inp_h, self._inp_w),
-                                    mode="bilinear", align_corners=False)
-
-        raw = self._trt_forward(inp)
+        raw = None
+        if plan.deterministic and getattr(self, "_use_graphs", False):
+            raw = self._forward_input_graph(frames, plan, fmt)
+        if raw is None:
+            raw = self._forward_eager(frames, plan, fmt)
 
         # ── Post-NMS path: (N, K, 6) — x1,y1,x2,y2,conf,cls in pixel coords
         if self._nms_in_model:
