@@ -6,7 +6,11 @@ TORCH_TAG="v2.5.1"
 VISION_TAG="v0.20.1"
 CUDA_ARCH="6.1"
 BUILD_IMAGE="nvidia/cuda:12.2.2-devel-ubuntu22.04"
-IMAGE_TAG="frigate-inference:sm_61"
+VERSION="$(cat "$(dirname "${BASH_SOURCE[0]}")/../../VERSION")"
+# Version and arch both matter: two arch builds exist and .env picks one.
+IMAGE_TAG="frigate-inference:v${VERSION}-sm_61"
+# Moving tag, so existing .env entries keep working.
+ARCH_TAG="frigate-inference:sm_61"
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,5 +88,6 @@ cd "${BUILD_ROOT}"
 docker build \
     --file arch/sm_61/Dockerfile \
     --tag "${IMAGE_TAG}" \
+    --tag "${ARCH_TAG}" \
     .
-echo "Done: ${IMAGE_TAG}"
+echo "Done: ${IMAGE_TAG} (also tagged ${ARCH_TAG})"

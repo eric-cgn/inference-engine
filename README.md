@@ -1,18 +1,36 @@
 # Frigate-Compatible ZMQ Inference Pipeliner
 
-**Version: [v1.2](CHANGELOG.md)**
+**Version: [v1.3](CHANGELOG.md)**
 
-A GPU-accelerated TensorRT inference server for Frigate NVR. Provides pipelined inference
-via Frigate's built-in ZMQ detector protocol, with support for Frigate+ models and Pascal GPUs.
+A GPU-accelerated TensorRT inference server for Frigate NVR. It speaks Frigate's built-in
+ZMQ detector protocol, so it needs no patched Frigate container, and runs Frigate+ models
+on hardware from Pascal through Blackwell.
 
-This is not part of any official distribution, is not endorsed by anyone, and comes with
-no guarantee of fitness for any purpose. Getting a working sm_61 build together was enough
-of a PITA that it seemed worth sharing — and these cards are still plenty capable of
-running YOLO `n` and `s` models at useful framerates.
+What it does beyond passing tensors to TensorRT:
 
-AI disclosure: this was written mostly by Claude and Gemini with little oversight. It
-works though, was tested on 1050 and 2060 cards, and got me off custom Frigate container
-builds while maintaining TRT engine performacne, which is very nice QOL upgrade.
+- **Applies the model's input transform on the GPU.** Frigate normally converts each frame
+  to the model's layout and dtype on the CPU before sending it. The engine advertises that
+  it can do this itself, so Frigate sends the frame as captured — a quarter of the bytes,
+  and the conversion runs on hardware built for it. This needs the detector-side change
+  that is still pending upstream; without it Frigate converts as before and everything
+  else works unchanged.
+- **Records preprocessing and inference into a single CUDA graph.** The transform is
+  resolved once per input format and replayed, rather than re-decided per frame.
+- **Compiles and caches TensorRT engines itself**, from ONNX or PyTorch weights, including
+  FP16 lowering for strongly-typed TensorRT 11 builds.
+- **Accepts models over the wire.** Frigate can hand it a `plus://` model it has already
+  downloaded; no shared model directory is required.
+
+Tested on a GTX 1050 Ti and an RTX 2060, against a 1535-sample regression corpus drawn from
+a live camera archive, with a unit suite covering the input handling.
+
+It is designed to run alongside the stock Frigate container, and is not part of any
+official distribution. It began because getting a working sm_61 build together was enough
+of a nuisance to seem worth sharing — those cards still run YOLO `n` and `s` models at
+useful framerates.
+
+AI disclosure: this was written mostly by Claude, with some oversight, and earlier
+contributions from Gemini.
 
 ## Why this exists
 
@@ -249,7 +267,10 @@ PyTorch wheels cover sm_75 through sm_120, so there is nothing to compile.
 arch/sm_75_121/build.sh
 ```
 
-Set `INFERENCE_IMAGE=frigate-inference:sm_75_121` in `.env`.
+Set `INFERENCE_IMAGE=frigate-inference:v1.3.0-sm_75_121` in `.env`. Builds are tagged
+with both the version and the arch, since the two arch images are not
+interchangeable; the bare `frigate-inference:sm_75_121` tag also moves to the
+latest build if you would rather not pin.
 
 #### Pascal — `sm_61`
 
@@ -315,6 +336,15 @@ These are easy to confuse. They are unrelated and set in different places:
 `precision` says; `int` only means Frigate ships raw uint8 and the ÷255 happens on the GPU
 instead of Frigate's CPU. See [Wire format](#wire-format) — it is worth **+17% on an RTX
 2060 and +26% on a GTX 1050 Ti**, and applies to every card.
+
+**On a `plus://` model this setting is silently ignored.** Frigate assigns
+`input_tensor`, `input_pixel_format` and `input_dtype` from the Frigate+ metadata
+unconditionally, so frames arrive as float32 NCHW no matter what the config says. Do not
+work around it by editing `model_cache/<id>.json` — that file is a cache keyed on
+existence, so deleting it reverts the edit, and it also supplies `labelMap`, so editing it
+risks desyncing class names from the weights. The fix is the `offload_input_transform`
+option on Frigate's `zmq` detector, which sends the frame as captured and leaves the
+Frigate+ model config alone. It is not in a Frigate release yet.
 
 ### Precision and your GPU
 

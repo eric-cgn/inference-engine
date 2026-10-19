@@ -14,12 +14,28 @@ _DEFAULTS = {
     "max_batch_size": 1,
     "optimize":       "always",
     "pascal_compat":  False,
+    # Who may connect to an ipc:// endpoint. Unset means "whoever owns the
+    # config file", which follows Frigate's PUID without being told.
+    "socket_uid":     None,
+    "socket_gid":     None,
 }
 
 _VALID_OPTIMIZE = {"always", "if_present", "never"}
 
 _TRUTHY = {"1", "true", "yes", "on"}
 _FALSEY = {"0", "false", "no", "off", ""}
+
+
+def _env_int(name: str, default):
+    """Parse an optional integer env var, warning (not raising) on garbage."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        logger.warning(f"{name}='{raw}' is not an integer — using default {default}")
+        return default
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -61,7 +77,12 @@ class ServerConfig:
         # Always inproc:// — workers and broker share the same container and context.
         self.backend_endpoint = "inproc://workers"
 
-        config_path = os.environ.get("CONFIG_PATH", "/config/inference.yaml")
+        self.socket_uid = _env_int("SOCKET_UID", _DEFAULTS["socket_uid"])
+        self.socket_gid = _env_int("SOCKET_GID", _DEFAULTS["socket_gid"])
+
+        config_path = self.config_path = os.environ.get(
+            "CONFIG_PATH", "/config/inference.yaml"
+        )
         if os.path.exists(config_path):
             try:
                 with open(config_path, "r") as f:
@@ -76,6 +97,8 @@ class ServerConfig:
                 if "NUM_WORKERS"    not in os.environ: self.num_workers    = int(data.get("num_workers",    self.num_workers))
                 if "MAX_BATCH_SIZE" not in os.environ: self.max_batch_size = int(data.get("max_batch_size", self.max_batch_size))
                 if "OPTIMIZE"       not in os.environ: self.optimize       = data.get("optimize",       self.optimize)
+                if "SOCKET_UID"     not in os.environ: self.socket_uid     = data.get("socket_uid",     self.socket_uid)
+                if "SOCKET_GID"     not in os.environ: self.socket_gid     = data.get("socket_gid",     self.socket_gid)
                 logger.info(f"Loaded configuration from {config_path}")
             except Exception as e:
                 logger.error(f"Failed to load config file {config_path}: {e}")
@@ -93,6 +116,8 @@ class ServerConfig:
             "precision":   self.precision,
             "engine_type": self.engine_type,
             "num_workers": self.num_workers,
+            "socket_uid": self.socket_uid,
+            "socket_gid": self.socket_gid,
             "max_batch":   self.max_batch_size,
             "optimize":    self.optimize,
             "pascal_compat": self.pascal_compat,

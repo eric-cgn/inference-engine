@@ -2,11 +2,14 @@ import logging
 import threading
 import zmq
 
+from .batch import open_ipc_socket
+
 logger = logging.getLogger("broker")
 
 
 def run_broker(frontend_endpoint: str, backend_endpoint: str,
-               ctx: zmq.Context = None, ready: threading.Event = None):
+               ctx: zmq.Context = None, ready: threading.Event = None,
+               socket_owner=None, socket_uid=None, socket_gid=None):
     """
     ZMQ ROUTER-DEALER broker.
 
@@ -31,9 +34,11 @@ def run_broker(frontend_endpoint: str, backend_endpoint: str,
 
     frontend = ctx.socket(zmq.ROUTER)
     frontend.bind(frontend_endpoint)
+    open_ipc_socket(frontend_endpoint, socket_owner, socket_uid, socket_gid)
 
     backend = ctx.socket(zmq.DEALER)
     backend.bind(backend_endpoint)
+    open_ipc_socket(backend_endpoint, socket_owner, socket_uid, socket_gid)
 
     logger.info(
         f"Broker started — frontend: {frontend_endpoint}  backend: {backend_endpoint}"
