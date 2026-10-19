@@ -63,7 +63,8 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
             name = header.get("model_name")
             if not name:
                 logger.error("model_request missing model_name")
-                resp = json.dumps({"model_available": False, "model_loaded": False, "request_id": req_id}).encode()
+                resp = json.dumps({"model_available": False, "model_loaded": False,
+                                   "input_transform_offload": True, "request_id": req_id}).encode()
             else:
                 engine._compile_failed = False
                 path = f"{engine.model_dir}/{name}"
@@ -74,7 +75,8 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
                     else:
                         with _CURRENT_MODEL_LOCK:
                             _CURRENT_MODEL_NAME = name
-                resp = json.dumps({"model_available": loaded, "model_loaded": loaded, "request_id": req_id}).encode()
+                resp = json.dumps({"model_available": loaded, "model_loaded": loaded,
+                                   "input_transform_offload": True, "request_id": req_id}).encode()
             control_replies.append((ident, resp))
             continue
 
@@ -82,7 +84,8 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
             name = header.get("model_name")
             if not name or len(msg) < 4:
                 logger.error("model_data missing model_name or payload frame")
-                resp = json.dumps({"model_saved": False, "model_loaded": False, "request_id": req_id}).encode()
+                resp = json.dumps({"model_saved": False, "model_loaded": False,
+                                   "input_transform_offload": True, "request_id": req_id}).encode()
             else:
                 save_name = name
                 if not os.path.splitext(name)[1]:
@@ -115,10 +118,12 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
                         else:
                             with _CURRENT_MODEL_LOCK:
                                 _CURRENT_MODEL_NAME = name
-                    resp = json.dumps({"model_saved": True, "model_loaded": loaded, "request_id": req_id}).encode()
+                    resp = json.dumps({"model_saved": True, "model_loaded": loaded,
+                                       "input_transform_offload": True, "request_id": req_id}).encode()
                 except Exception as e:
                     logger.error(f"Failed to save model {name}: {e}")
-                    resp = json.dumps({"model_saved": False, "model_loaded": False, "request_id": req_id}).encode()
+                    resp = json.dumps({"model_saved": False, "model_loaded": False,
+                                   "input_transform_offload": True, "request_id": req_id}).encode()
             control_replies.append((ident, resp))
             continue
 
