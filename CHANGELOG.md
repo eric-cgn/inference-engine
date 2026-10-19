@@ -4,6 +4,10 @@
 
 Rebuild required.
 
+Images are now tagged with the version as well as the arch, for example
+`frigate-inference:v1.3.0-sm_75_121`. The bare arch tag still moves to the latest
+build, so an existing `INFERENCE_IMAGE` keeps working.
+
 - **Resolve the input transform once, instead of re-deciding it per frame.**
   `_run_trt` used to re-run a layout heuristic, a dtype branch and a resize
   check on every frame, and on the float path a `t.max() > 1.5` value sniff

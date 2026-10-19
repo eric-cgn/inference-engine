@@ -267,7 +267,10 @@ PyTorch wheels cover sm_75 through sm_120, so there is nothing to compile.
 arch/sm_75_121/build.sh
 ```
 
-Set `INFERENCE_IMAGE=frigate-inference:sm_75_121` in `.env`.
+Set `INFERENCE_IMAGE=frigate-inference:v1.3.0-sm_75_121` in `.env`. Builds are tagged
+with both the version and the arch, since the two arch images are not
+interchangeable; the bare `frigate-inference:sm_75_121` tag also moves to the
+latest build if you would rather not pin.
 
 #### Pascal — `sm_61`
 
