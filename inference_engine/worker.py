@@ -33,4 +33,7 @@ def run_worker(idx, cfg, shared_name, worker_socket):
         ctx               = None,
         name              = f"worker-{idx}",
         shared_model_name = shared_name,
+        socket_owner      = getattr(cfg, "config_path", None),
+        socket_uid        = getattr(cfg, "socket_uid", None),
+        socket_gid        = getattr(cfg, "socket_gid", None),
     )

@@ -73,6 +73,9 @@ def main():
             max_batch_size= config.max_batch_size,
             connect       = False,
             name          = "worker",
+            socket_owner  = config.config_path,
+            socket_uid    = config.socket_uid,
+            socket_gid    = config.socket_gid,
         )
 
     else:
@@ -95,6 +98,9 @@ def main():
             kwargs=dict(
                 frontend_endpoint = config.endpoint,
                 backend_endpoint  = f"ipc://{worker_socket}",
+                socket_owner      = config.config_path,
+                socket_uid        = config.socket_uid,
+                socket_gid        = config.socket_gid,
             ),
             daemon=True,
             name="broker",

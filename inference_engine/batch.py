@@ -176,10 +176,76 @@ def _decode_msgs(msgs, engine, max_batch_size, stats=None, shared_model_name=Non
     return control_replies, identities, request_ids, frames, deferred
 
 
+def open_ipc_socket(endpoint: str, owner_path: str = None,
+                    uid: int = None, gid: int = None) -> None:
+    """Let the client connect to an ipc:// endpoint, without opening it to all.
+
+    ZeroMQ creates the socket file with the process umask, so an engine
+    running as root leaves it mode 0755 and root owned. Connecting to a unix
+    socket needs write permission, so a client running as any other user gets
+    EAGAIN on every request and times out. Nothing is logged on either side:
+    the engine never sees the request, and the client only sees a timeout.
+    Frigate 0.19 runs its detector processes as a non-root user and hits this.
+
+    The owner is taken from the config file rather than configured, because
+    Frigate chowns everything under /config to the uid its detectors run as,
+    so this follows a remapped PUID with nothing to set. The /config directory
+    itself is not usable for this -- its group is overwritten with
+    frigate-data so the go2rtc user can traverse it -- but the files under it
+    carry the real uid and gid.
+
+    Re-derived on every launch, since the socket is recreated on each bind.
+
+    A root owned config means either a root client, where the default is
+    already correct, or a config that Frigate does not manage. Both are left
+    alone: chowning the socket to root would silently recreate the bug.
+    """
+    if not endpoint.startswith("ipc://"):
+        return
+    path = endpoint[len("ipc://"):]
+
+    try:
+        if uid is None and gid is None:
+            if not owner_path or not os.path.exists(owner_path):
+                logger.warning(
+                    f"No config file to take ownership from; leaving {path} "
+                    f"as root. A client running as another user will not be "
+                    f"able to connect; set socket_uid in inference.yaml."
+                )
+                return
+            st = os.stat(owner_path)
+            uid, gid = st.st_uid, st.st_gid
+            if uid == 0:
+                logger.warning(
+                    f"{owner_path} is root owned, leaving {path} at root "
+                    f"0755. Correct for a root client; a client running as "
+                    f"another user will not be able to connect. If Frigate's "
+                    f"UID changed, let Frigate start first, then restart "
+                    f"inference-engine."
+                )
+                return
+            source = owner_path
+        else:
+            source = "config"
+
+        os.chown(path, -1 if uid is None else uid, -1 if gid is None else gid)
+        os.chmod(path, 0o660)
+        st = os.stat(path)
+        logger.info(
+            f"IPC socket {path} uid={st.st_uid} gid={st.st_gid} mode=660 "
+            f"(from {source}). If Frigate's UID changed, restart "
+            f"inference-engine to pick it up -- Frigate rewrites /config "
+            f"ownership on its own startup, so let it start first."
+        )
+    except OSError as e:
+        logger.warning(f"Could not set ownership on {path}: {e}")
+
+
 def run_batch_worker(endpoint: str, engine: InferenceEngine,
                      max_batch_size: int = 16, connect: bool = False,
                      ctx: zmq.Context = None, name: str = "worker",
-                     shared_model_name=None):
+                     shared_model_name=None, socket_owner=None,
+                     socket_uid=None, socket_gid=None):
     """
     Pipelined dynamic batch inference worker.
 
@@ -211,6 +277,7 @@ def run_batch_worker(endpoint: str, engine: InferenceEngine,
     else:
         sock = ctx.socket(zmq.ROUTER)
         sock.bind(endpoint)
+        open_ipc_socket(endpoint, socket_owner, socket_uid, socket_gid)
         logger.info(f"Batch worker bound to {endpoint} (standalone, max_batch={max_batch_size})")
 
     stats = RollingStats(name)

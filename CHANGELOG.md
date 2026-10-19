@@ -46,6 +46,36 @@ Rebuild required.
   format state would silently desync, and the failure mode is an invisibly
   wrong frame rather than an error.
 
+- **Advertise `input_transform_offload` in the model handshake.** A client that
+  converts the frame to the model's layout and dtype before sending it pays a
+  strided gather over the whole tensor and ships 4x the bytes. The handshake
+  reply now says the engine can apply that transform itself, so a client can
+  send the frame as captured and declare the model's expected `input_tensor`
+  and `input_dtype` in the request header instead. Clients that do not
+  understand the field are unaffected.
+
+  Reported as a capability rather than configured: the engine is what knows
+  whether it can apply the transform, and a client that merely believed it
+  could would send unconverted frames to a model that cannot take them.
+
+- **Match the `ipc://` socket's owner to the config file's.** ZeroMQ creates
+  the socket with the process umask, so an engine running as root left it mode
+  0755 and root owned. Connecting to a unix socket needs write permission, so
+  a client running as another user got `EAGAIN` on every request and timed
+  out, with nothing logged on either side. Frigate 0.19 runs its detector
+  processes as a non-root user and hit this on every request.
+
+  The socket is now chowned to whoever owns the engine's config file and set
+  to 0660, re-derived on every launch. Frigate chowns everything under
+  `/config` to the uid its detectors run as, so this follows a remapped `PUID`
+  with nothing to configure. `socket_uid` and `socket_gid` override it when
+  the config lives outside Frigate's directory.
+
+  A root owned config is left alone: that means either a root client, where
+  the default already works, or a config Frigate does not manage, and chowning
+  to root would silently recreate the bug. The resolved uid, gid and mode are
+  logged at startup, since the failure mode is otherwise invisible.
+
 - **Document how to get the uint8 wire format on a `plus://` model.** The
   `input_dtype: int` setting described under *Two independent "data type"
   settings* works on a normal model path, but Frigate's
