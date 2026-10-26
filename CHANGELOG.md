@@ -43,8 +43,9 @@ build, so an existing `INFERENCE_IMAGE` keeps working.
   previous behaviour exactly: integer frames are scaled, float frames are
   scaled only if they look denormalized. Existing clients are unaffected.
 
-  Frigate sends these fields when the `offload_input_transform` option is set
-  on its `zmq` detector. They are sent per request rather than at `load_model`
+  Frigate 0.19 and later sends these fields once the engine reports
+  `input_transform_offload` in the model handshake; there is nothing to
+  configure on either side. They are sent per request rather than at `load_model`
   on purpose: a worker can lazily load the active model from
   `shared_model_name` without ever having seen the handshake, so load-time
   format state would silently desync, and the failure mode is an invisibly

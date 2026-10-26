@@ -3,17 +3,18 @@
 **Version: [v1.3](CHANGELOG.md)**
 
 A GPU-accelerated TensorRT inference server for Frigate NVR. It speaks Frigate's built-in
-ZMQ detector protocol, so it needs no patched Frigate container, and runs Frigate+ models
-on hardware from Pascal through Blackwell.
+ZMQ detector protocol, so it needs no patched Frigate container, and runs object detection
+models -- Frigate+, YOLO26, YOLO11 and other ONNX or PyTorch detectors -- on hardware from
+Pascal through Blackwell.
 
 What it does beyond passing tensors to TensorRT:
 
 - **Applies the model's input transform on the GPU.** Frigate normally converts each frame
   to the model's layout and dtype on the CPU before sending it. The engine advertises that
   it can do this itself, so Frigate sends the frame as captured — a quarter of the bytes,
-  and the conversion runs on hardware built for it. This needs the detector-side change
-  that is still pending upstream; without it Frigate converts as before and everything
-  else works unchanged.
+  and the conversion runs on hardware built for it. Negotiated automatically with Frigate
+  0.19 and later; on earlier versions Frigate converts as before and everything else works
+  unchanged.
 - **Records preprocessing and inference into a single CUDA graph.** The transform is
   resolved once per input format and replayed, rather than re-decided per frame.
 - **Compiles and caches TensorRT engines itself**, from ONNX or PyTorch weights, including
@@ -342,9 +343,12 @@ instead of Frigate's CPU. See [Wire format](#wire-format) — it is worth **+17%
 unconditionally, so frames arrive as float32 NCHW no matter what the config says. Do not
 work around it by editing `model_cache/<id>.json` — that file is a cache keyed on
 existence, so deleting it reverts the edit, and it also supplies `labelMap`, so editing it
-risks desyncing class names from the weights. The fix is the `offload_input_transform`
-option on Frigate's `zmq` detector, which sends the frame as captured and leaves the
-Frigate+ model config alone. It is not in a Frigate release yet.
+risks desyncing class names from the weights.
+
+**Frigate 0.19 fixes this on its own.** The detector reports `input_transform_offload` in
+the model handshake, and Frigate then sends the frame as captured and declares the model's
+expected format in the request header, leaving the model config untouched. Nothing to
+configure, and it applies to `plus://` and ordinary model paths alike.
 
 ### Precision and your GPU
 
