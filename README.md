@@ -338,17 +338,16 @@ These are easy to confuse. They are unrelated and set in different places:
 instead of Frigate's CPU. See [Wire format](#wire-format) — it is worth **+17% on an RTX
 2060 and +26% on a GTX 1050 Ti**, and applies to every card.
 
-**On a `plus://` model this setting is silently ignored.** Frigate assigns
-`input_tensor`, `input_pixel_format` and `input_dtype` from the Frigate+ metadata
-unconditionally, so frames arrive as float32 NCHW no matter what the config says. Do not
-work around it by editing `model_cache/<id>.json` — that file is a cache keyed on
-existence, so deleting it reverts the edit, and it also supplies `labelMap`, so editing it
-risks desyncing class names from the weights.
+**A `plus://` model ignores this setting**, along with every other key in the `model:`
+block. `check_and_load_plus_model()` overwrites `width`, `height`, `model_type`,
+`input_tensor`, `input_pixel_format` and `input_dtype` from the Frigate+ metadata, so the
+example above sets only `path:`. Do not reach for `model_cache/<id>.json` either — it is a
+cache keyed on existence, so deleting it reverts the edit, and it supplies `labelMap`, so
+editing it risks desyncing class names from the weights.
 
-**Frigate 0.19 fixes this on its own.** The detector reports `input_transform_offload` in
-the model handshake, and Frigate then sends the frame as captured and declares the model's
-expected format in the request header, leaving the model config untouched. Nothing to
-configure, and it applies to `plus://` and ordinary model paths alike.
+On Frigate 0.19 and later this costs nothing anyway: the detector reports
+`input_transform_offload` in the model handshake and Frigate sends the frame as captured,
+whatever the resolved format says.
 
 ### Precision and your GPU
 
@@ -451,15 +450,10 @@ model:
 # ── Frigate+ model ────────────────────────────────────────────────────────────
 # Uncomment and replace with your plus:// model URL from the Frigate+ dashboard.
 # Frigate transfers the model to the inference engine automatically on first run.
-# No labelmap needed — Frigate+ models include their own label set.
+# Set nothing else: the Frigate+ metadata carries the labels, the model type, the
+# dimensions and the wire format, and overwrites whatever you put here.
 # model:
 #   path: plus://your-model-id-here
-#   model_type: yolov8
-#   input_tensor: nhwc
-#   input_dtype: int
-#   input_pixel_format: rgb
-#   width: 640
-#   height: 640
 ```
 
 ### Wire format
@@ -480,13 +474,10 @@ per-format figures are in [Performance](#performance).
 
 All three wire formats produce identical detections; only the cost differs.
 
-**Frigate+ models ignore these settings.** Their metadata carries `inputShape` and
-`inputDataType`, and Frigate applies those after your config, so neither the `model:`
-block nor a per-detector `model:` override changes the resolved wire format. A `plus://`
-model uses whatever it was published with — commonly `nchw` + `float`. That path is not
-slow: it is exactly what the float32 NCHW fast path exists to accelerate, uploading the
-frame to the GPU with no CPU conversion at all. The table above applies to local models
-(`yolo26n`, your own `.onnx`), where the setting is yours to choose.
+**Frigate+ models ignore these settings** — their metadata fixes the wire format, usually
+`nchw` + `float`. That is not the slow path here: float32 NCHW is exactly what the fast
+path exists for, uploaded to the GPU with no CPU conversion at all. The table above
+applies to local models (`yolo26n`, your own `.onnx`), where the choice is yours.
 
 ## Compose integration
 
